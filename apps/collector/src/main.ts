@@ -1,6 +1,7 @@
-import { createClient } from '@clickhouse/client';
-import { Kafka, logLevel } from 'kafkajs';
-import { SpanEventSchema, toClickHouseRow } from '@trace-ops/contracts';
+import { ClickHouseLogLevel, createClient } from '@clickhouse/client';
+import { Kafka, KafkaJSError, logLevel } from 'kafkajs';
+import type { toClickHouseRow } from '@trace-ops/contracts';
+import { processSpanBatch, type CollectorMessage, type InvalidReason } from './batch-processor';
 
 const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',').map((broker) => broker.trim());
 const topic = process.env.KAFKA_TOPIC ?? 'ai-spans';
@@ -18,68 +19,193 @@ const clickhouse = createClient({
   username: process.env.CLICKHOUSE_USER ?? 'trace_ops',
   password: process.env.CLICKHOUSE_PASSWORD ?? 'trace_ops_dev_only',
   database: process.env.CLICKHOUSE_DATABASE ?? 'observability',
+  // The client's default error logger may include server response details.
+  // Keep payload-adjacent ClickHouse errors out of logs; retry via safe Kafka errors below.
+  log: { level: ClickHouseLogLevel.OFF },
 });
 
-async function bootstrap() {
-  await consumer.connect();
-  await consumer.subscribe({ topic, fromBeginning: false });
-  console.log(`Collector subscribed to ${topic}; ClickHouse table: ${table}`);
+const heartbeatPeriodMs = 1_000;
+let stopping = false;
+let startupOperation: Promise<unknown> | undefined;
+let closePromise: Promise<void> | undefined;
 
+function withStartupOperation<T>(operation: Promise<T>): Promise<T> {
+  startupOperation = operation;
+  return operation.finally(() => {
+    if (startupOperation === operation) startupOperation = undefined;
+  });
+}
+
+function isActive(isRunning: () => boolean, isStale: () => boolean): boolean {
+  return !stopping && isRunning() && !isStale();
+}
+
+async function insertWithHeartbeat(
+  rows: ReturnType<typeof toClickHouseRow>[],
+  heartbeat: () => Promise<void>,
+  canContinue: () => boolean,
+): Promise<void> {
+  let stopped = false;
+  let heartbeatFailed = false;
+  let insertFailed = false;
+  let wakeHeartbeat: (() => void) | undefined;
+
+  const heartbeatLoop = (async () => {
+    while (!stopped) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, heartbeatPeriodMs);
+        wakeHeartbeat = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+      });
+      wakeHeartbeat = undefined;
+
+      if (stopped || !canContinue()) return;
+      try {
+        await heartbeat();
+      } catch {
+        // Do not retain or log Kafka's error object or its cause.
+        heartbeatFailed = true;
+        return;
+      }
+    }
+  })();
+
+  try {
+    if (canContinue()) {
+      await clickhouse.insert({ table, values: rows, format: 'JSONEachRow' });
+    }
+  } catch {
+    // The original ClickHouse error can include request details. Discard it.
+    insertFailed = true;
+  } finally {
+    stopped = true;
+    wakeHeartbeat?.();
+    await heartbeatLoop;
+  }
+
+  // If assignment or shutdown changed while the insert was in flight, leave
+  // the offsets uncommitted so the next owner/restart can safely replay them.
+  if (!canContinue()) return;
+  if (heartbeatFailed) {
+    throw new KafkaJSError('Kafka heartbeat failed during ClickHouse insert', { retriable: true });
+  }
+  if (insertFailed) {
+    // KafkaJS restarts only retriable crashes. This safe wrapper intentionally
+    // has no cause so the original ClickHouse exception cannot leak to logs.
+    throw new KafkaJSError('ClickHouse batch insert failed', { retriable: true });
+  }
+}
+
+const invalidReasonNames: readonly InvalidReason[] = [
+  'empty_payload',
+  'invalid_json',
+  'invalid_schema',
+];
+
+function logInvalidBatch(
+  counts: Record<InvalidReason, number>,
+  batchTopic: string,
+  partition: number,
+): void {
+  const invalidCount = invalidReasonNames.reduce((total, reason) => total + counts[reason], 0);
+  if (invalidCount === 0) return;
+
+  // Log only safe categories and counts, never payloads or validation details.
+  console.warn(`Collector discarded ${invalidCount} invalid message(s) from ${batchTopic}[${partition}]`, counts);
+}
+
+async function bootstrap(): Promise<void> {
+  await withStartupOperation(consumer.connect());
+  if (stopping) return;
+
+  await withStartupOperation(consumer.subscribe({ topic, fromBeginning: true }));
+  if (stopping) return;
+
+  console.log(`Collector subscribed to ${topic}; ClickHouse table: ${table}`);
   await consumer.run({
     autoCommit: false,
     eachBatchAutoResolve: false,
     eachBatch: async ({ batch, resolveOffset, heartbeat, isRunning, isStale }) => {
-      if (!isRunning() || isStale()) return;
-
-      const rows: ReturnType<typeof toClickHouseRow>[] = [];
-      let invalidCount = 0;
-
-      for (const message of batch.messages) {
-        const raw = message.value?.toString();
-        if (!raw) {
-          invalidCount += 1;
-          resolveOffset(message.offset);
-          continue;
-        }
-
-        try {
-          const event = SpanEventSchema.parse(JSON.parse(raw));
-          rows.push(toClickHouseRow(event));
-        } catch (error) {
-          invalidCount += 1;
-          const reason = error instanceof Error ? error.message : 'invalid span payload';
-          console.warn(`Skipped invalid Span at ${batch.topic}/${batch.partition}/${message.offset}: ${reason}`);
-        }
-        resolveOffset(message.offset);
-      }
-
-      if (rows.length > 0) {
-        await clickhouse.insert({ table, values: rows, format: 'JSONEachRow' });
-      }
-
-      if (invalidCount > 0) console.warn(`Invalid Span count in batch: ${invalidCount}`);
-      const nextOffset = (BigInt(batch.lastOffset()) + 1n).toString();
-      await consumer.commitOffsets([{ topic: batch.topic, partition: batch.partition, offset: nextOffset }]);
+      if (!isActive(isRunning, isStale)) return;
       await heartbeat();
+
+      const invalidCounts: Record<InvalidReason, number> = {
+        empty_payload: 0,
+        invalid_json: 0,
+        invalid_schema: 0,
+      };
+      const messages: CollectorMessage[] = batch.messages.map(({ offset, value }) => ({ offset, value }));
+
+      try {
+        await processSpanBatch(messages, {
+          insert: async (rows) => {
+            await insertWithHeartbeat(rows, heartbeat, () => isActive(isRunning, isStale));
+          },
+          commit: async (lastProcessedOffset, nextOffset) => {
+            if (!isActive(isRunning, isStale)) return;
+
+            await consumer.commitOffsets([{
+              topic: batch.topic,
+              partition: batch.partition,
+              offset: nextOffset,
+            }]);
+            resolveOffset(lastProcessedOffset);
+          },
+          onInvalid: (reason) => {
+            invalidCounts[reason] += 1;
+          },
+        });
+      } finally {
+        logInvalidBatch(invalidCounts, batch.topic, batch.partition);
+      }
     },
   });
 }
 
-let stopping = false;
-async function shutdown(signal: string) {
-  if (stopping) return;
+async function closeResources(): Promise<void> {
+  if (closePromise) return closePromise;
   stopping = true;
-  console.log(`Received ${signal}; stopping Collector...`);
-  await consumer.stop().catch(() => undefined);
-  await Promise.allSettled([consumer.disconnect(), clickhouse.close()]);
-  process.exit(0);
+
+  closePromise = (async () => {
+    if (startupOperation) await startupOperation.catch(() => undefined);
+
+    try {
+      await consumer.stop();
+    } catch {
+      console.error('Collector encountered a consumer shutdown failure');
+      process.exitCode = 1;
+    }
+
+    const results = await Promise.allSettled([consumer.disconnect(), clickhouse.close()]);
+    if (results.some((result) => result.status === 'rejected')) {
+      console.error('Collector encountered a resource cleanup failure');
+      process.exitCode = 1;
+    }
+  })();
+
+  return closePromise;
 }
 
-process.once('SIGINT', () => void shutdown('SIGINT'));
-process.once('SIGTERM', () => void shutdown('SIGTERM'));
+async function shutdown(signal: string): Promise<void> {
+  if (!closePromise) console.log(`Received ${signal}; stopping Collector...`);
+  await closeResources();
+}
 
-void bootstrap().catch(async (error: unknown) => {
-  console.error('Collector startup failed:', error);
-  await Promise.allSettled([consumer.disconnect(), clickhouse.close()]);
+process.once('SIGINT', () => {
+  void shutdown('SIGINT').catch(() => {
+    process.exitCode = 1;
+  });
+});
+process.once('SIGTERM', () => {
+  void shutdown('SIGTERM').catch(() => {
+    process.exitCode = 1;
+  });
+});
+
+void bootstrap().catch(async () => {
+  console.error('Collector stopped after an unrecoverable startup or runtime failure');
   process.exitCode = 1;
+  await closeResources();
 });
