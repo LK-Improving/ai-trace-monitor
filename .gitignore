@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+.turbo/
+.vite/
+.playwright-cli/
+.env
+.env.*
+!.env.example
+*.log
+*.tsbuildinfo
+apps/web/dist/
+apps/api/dist/
+apps/collector/dist/
+packages/*/dist/

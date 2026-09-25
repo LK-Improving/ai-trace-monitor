@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#fbfbf9" />
+    <meta name="description" content="Trace Ops 浏览器监控 SDK 本地验收页" />
+    <link rel="icon" href="data:," />
+    <title>浏览器 SDK 验收 · Trace Ops</title>
+  </head>
+  <body>
+    <div class="sdk-lab" id="sdk-lab">
+      <header class="lab-topbar">
+        <a class="brand" href="/" aria-label="返回 Trace Ops 控制台">TRACE <span>OPS</span></a>
+        <div class="topbar-right">
+          <span class="local-badge"><i></i>本地验收 · 不接入平台</span>
+          <a class="back-link" href="/">返回控制台 <span aria-hidden="true">↗</span></a>
+        </div>
+      </header>
+
+      <main class="lab-main">
+        <section class="page-heading">
+          <div>
+            <p class="eyebrow">W3 / BROWSER INSTRUMENTATION</p>
+            <h1>浏览器 SDK 验收</h1>
+            <p class="heading-copy">在本地确认采集开关、Trace ID 透传与前端错误脱敏。这里产生的事件只保存在当前页面内存中。</p>
+          </div>
+          <div class="heading-mark" aria-hidden="true"><span>TRACE</span><b>→</b><span>EVENT</span></div>
+        </section>
+
+        <section class="lab-grid" aria-label="SDK 配置和合成场景">
+          <article class="panel session-panel">
+            <div class="panel-heading">
+              <div><span class="section-index">01 / SESSION</span><h2>采集会话</h2></div>
+              <span id="sdk-state" class="state-pill" data-state="stopped"><i></i><span>未启动</span></span>
+            </div>
+            <p class="panel-copy">服务名固定为 <code>web-sdk-demo</code>，环境为 <code>dev</code>。此页不会创建项目密钥或调用管理 API。</p>
+            <div class="session-actions">
+              <button class="button primary" id="start-sdk" type="button">启动 SDK</button>
+              <button class="button secondary" id="stop-sdk" type="button" disabled>停止采集</button>
+            </div>
+            <div class="switch-list">
+              <label class="switch-row"><span><strong>前端异常</strong><small>网络错误、JS Error、Promise rejection</small></span><input id="capture-errors" type="checkbox" checked /><i aria-hidden="true"></i></label>
+              <label class="switch-row"><span><strong>Web Vitals</strong><small>CLS / INP / LCP / FCP / TTFB</small></span><input id="capture-vitals" type="checkbox" checked /><i aria-hidden="true"></i></label>
+            </div>
+            <div class="trace-card">
+              <div><span class="section-index">CURRENT TRACE ID</span><span class="trace-valid" id="trace-valid">等待启动</span></div>
+              <code id="current-trace-id">尚未生成</code>
+              <small>本页面合成事件共用该 ID；刷新页面可生成新 ID。</small>
+            </div>
+          </article>
+
+          <article class="panel scenario-panel">
+            <div class="panel-heading">
+              <div><span class="section-index">02 / SYNTHETIC EVENTS</span><h2>触发验收场景</h2></div>
+              <span class="local-only">仅本地合成</span>
+            </div>
+            <p class="panel-copy">先启动 SDK，再触发任一场景。错误内容使用固定测试标记，不包含用户输入。</p>
+            <div class="scenario-list">
+              <button class="scenario-button" id="trigger-fetch" type="button" disabled>
+                <span class="scenario-number">01</span><span class="scenario-text"><strong>同源 HTTP 失败</strong><small>GET 本地测试端点 · 503 · 空请求体</small></span><span class="scenario-arrow" aria-hidden="true">↗</span>
+              </button>
+              <button class="scenario-button" id="trigger-js-error" type="button" disabled>
+                <span class="scenario-number">02</span><span class="scenario-text"><strong>JavaScript Error</strong><small>派发合成 ErrorEvent，不抛真实异常</small></span><span class="scenario-arrow" aria-hidden="true">↗</span>
+              </button>
+              <button class="scenario-button" id="trigger-rejection" type="button" disabled>
+                <span class="scenario-number">03</span><span class="scenario-text"><strong>Promise rejection</strong><small>派发合成 rejection 事件，不产生真实未处理 Promise</small></span><span class="scenario-arrow" aria-hidden="true">↗</span>
+              </button>
+            </div>
+            <p class="request-note"><span class="note-icon" aria-hidden="true">i</span><span>HTTP 场景只请求当前站点的 <code>/__sdk_test__/http-error</code>，无 body、无 Authorization；SDK 不读取响应内容。</span></p>
+          </article>
+        </section>
+
+        <section class="panel events-panel" aria-labelledby="events-title">
+          <div class="panel-heading events-heading">
+            <div><span class="section-index">03 / LOCAL EVENT SINK</span><h2 id="events-title">本地事件</h2></div>
+            <div class="event-actions"><span id="event-count" class="event-count">0 条</span><button class="button secondary compact" id="clear-events" type="button">清空</button></div>
+          </div>
+          <div class="event-summary" aria-live="polite">
+            <div><span>Trace ID 校验</span><strong id="trace-check" data-state="idle">等待事件</strong></div>
+            <div><span>合成标记泄漏</span><strong id="privacy-check" data-state="idle">等待事件</strong></div>
+            <div><span>事件出口</span><strong>仅 onEvent · 页面内存</strong></div>
+          </div>
+          <div class="event-workspace">
+            <div class="event-list" id="event-list" aria-live="polite" aria-label="SDK 收到的脱敏事件">
+              <div class="empty-state"><span class="empty-glyph" aria-hidden="true">∅</span><strong>还没有事件</strong><small>启动 SDK 后，从上方选择一个合成场景。</small></div>
+            </div>
+            <aside class="event-detail">
+              <div class="detail-heading"><span>SAFE EVENT PAYLOAD</span><span class="memory-tag"><i></i>MEMORY ONLY</span></div>
+              <pre id="event-json">// 收到事件后，仅显示 SDK onEvent 回调中的字段</pre>
+              <p>视图通过 <code>textContent</code> 渲染。不会保存到 localStorage、网络服务或平台后端。</p>
+            </aside>
+          </div>
+        </section>
+
+        <footer class="lab-footer"><span>TRACE OPS <i>·</i> SDK acceptance fixture</span><span>固定合成数据 <i>·</i> 不包含 Prompt / Response / 用户原文</span></footer>
+      </main>
+    </div>
+    <script type="module" src="/src/sdk-test.ts"></script>
+  </body>
+</html>

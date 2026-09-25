@@ -1,0 +1,17 @@
+{
+  "name": "ai-trace-monitor",
+  "private": true,
+  "packageManager": "pnpm@10.22.0",
+  "scripts": {
+    "dev": "pnpm --filter @trace-ops/contracts build && dotenv -e .env -- concurrently -k -n web,api,collector -c blue,green,yellow \"pnpm --filter @trace-ops/web dev\" \"pnpm --filter @trace-ops/api dev\" \"pnpm --filter @trace-ops/collector dev\"",
+    "build": "pnpm --filter @trace-ops/contracts build && pnpm --filter @trace-ops/api build && pnpm --filter @trace-ops/collector build && pnpm --filter @trace-ops/web build",
+    "typecheck": "pnpm --filter @trace-ops/contracts build && pnpm --filter @trace-ops/contracts typecheck && pnpm --filter @trace-ops/api typecheck && pnpm --filter @trace-ops/collector typecheck && pnpm --filter @trace-ops/web typecheck",
+    "infra:up": "docker compose up -d --wait",
+    "infra:down": "docker compose down"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "dotenv-cli": "^8.0.0",
+    "typescript": "^5.8.3"
+  }
+}

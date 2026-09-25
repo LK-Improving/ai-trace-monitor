@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="AI Trace Monitor 可交互产品原型" />
+    <title>Trace//Ops · AI 全链路监控</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand-row">
+          <div>
+            <div class="brand-name">TRACE OPS</div>
+          </div>
+        </div>
+
+        <button class="project-switcher" type="button" aria-label="当前项目：客服智能体，production 环境">
+          <i class="bi bi-grid project-mobile-icon" aria-hidden="true"></i>
+          <span class="project-copy"><strong>客服智能体</strong><small>production</small></span>
+          <i class="bi bi-chevron-down chevron" aria-hidden="true"></i>
+        </button>
+
+        <nav class="main-nav" aria-label="主导航">
+          <button class="nav-item is-active" data-page="overview" aria-label="总览"><i class="bi bi-grid-1x2 nav-icon" aria-hidden="true"></i><span>总览</span></button>
+          <button class="nav-item" data-page="traces" aria-label="Traces"><i class="bi bi-diagram-3 nav-icon" aria-hidden="true"></i><span>Traces</span></button>
+          <button class="nav-item" data-page="ai" aria-label="AI 链路"><i class="bi bi-bezier2 nav-icon" aria-hidden="true"></i><span>AI 链路</span></button>
+          <button class="nav-item" data-page="alerts" aria-label="告警"><i class="bi bi-bell nav-icon" aria-hidden="true"></i><span>告警</span><span class="nav-count alert-count">3</span></button>
+        </nav>
+
+        <div class="nav-divider"></div>
+        <nav class="main-nav">
+          <button class="nav-item" data-page="settings" aria-label="项目设置"><i class="bi bi-gear nav-icon" aria-hidden="true"></i><span>项目设置</span></button>
+        </nav>
+
+        <div class="sidebar-bottom">
+          <div class="version-row"><span>v0.8.0</span><button class="help-link" type="button" data-page-action="docs">帮助文档 <i class="bi bi-box-arrow-up-right" aria-hidden="true"></i></button></div>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar">
+          <span class="sr-only" id="pageTitle">运行概况</span>
+          <div class="top-actions">
+            <button class="top-link" type="button" data-action="about">关于</button>
+            <span class="top-divider" aria-hidden="true"></span>
+            <button class="top-link" type="button" data-page-action="docs">文档</button>
+            <span class="top-divider" aria-hidden="true"></span>
+            <button class="user-button" type="button" aria-label="用户 Z"><span class="avatar">Z</span></button>
+          </div>
+        </header>
+        <div id="pageRoot" class="page-root"></div>
+      </main>
+    </div>
+
+    <div id="toast" class="toast" role="status"></div>
+    <script src="./app.js"></script>
+  </body>
+</html>
