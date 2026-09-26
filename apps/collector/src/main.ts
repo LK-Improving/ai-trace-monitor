@@ -1,7 +1,7 @@
 import { ClickHouseLogLevel, createClient } from '@clickhouse/client';
-import { Kafka, KafkaJSError, logLevel } from 'kafkajs';
-import type { toClickHouseRow } from '@trace-ops/contracts';
+import { Kafka, logLevel } from 'kafkajs';
 import { processSpanBatch, type CollectorMessage, type InvalidReason } from './batch-processor';
+import { insertWithHeartbeat } from './clickhouse-sink';
 
 const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',').map((broker) => broker.trim());
 const topic = process.env.KAFKA_TOPIC ?? 'ai-spans';
@@ -24,7 +24,6 @@ const clickhouse = createClient({
   log: { level: ClickHouseLogLevel.OFF },
 });
 
-const heartbeatPeriodMs = 1_000;
 let stopping = false;
 let startupOperation: Promise<unknown> | undefined;
 let closePromise: Promise<void> | undefined;
@@ -38,64 +37,6 @@ function withStartupOperation<T>(operation: Promise<T>): Promise<T> {
 
 function isActive(isRunning: () => boolean, isStale: () => boolean): boolean {
   return !stopping && isRunning() && !isStale();
-}
-
-async function insertWithHeartbeat(
-  rows: ReturnType<typeof toClickHouseRow>[],
-  heartbeat: () => Promise<void>,
-  canContinue: () => boolean,
-): Promise<void> {
-  let stopped = false;
-  let heartbeatFailed = false;
-  let insertFailed = false;
-  let wakeHeartbeat: (() => void) | undefined;
-
-  const heartbeatLoop = (async () => {
-    while (!stopped) {
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, heartbeatPeriodMs);
-        wakeHeartbeat = () => {
-          clearTimeout(timer);
-          resolve();
-        };
-      });
-      wakeHeartbeat = undefined;
-
-      if (stopped || !canContinue()) return;
-      try {
-        await heartbeat();
-      } catch {
-        // Do not retain or log Kafka's error object or its cause.
-        heartbeatFailed = true;
-        return;
-      }
-    }
-  })();
-
-  try {
-    if (canContinue()) {
-      await clickhouse.insert({ table, values: rows, format: 'JSONEachRow' });
-    }
-  } catch {
-    // The original ClickHouse error can include request details. Discard it.
-    insertFailed = true;
-  } finally {
-    stopped = true;
-    wakeHeartbeat?.();
-    await heartbeatLoop;
-  }
-
-  // If assignment or shutdown changed while the insert was in flight, leave
-  // the offsets uncommitted so the next owner/restart can safely replay them.
-  if (!canContinue()) return;
-  if (heartbeatFailed) {
-    throw new KafkaJSError('Kafka heartbeat failed during ClickHouse insert', { retriable: true });
-  }
-  if (insertFailed) {
-    // KafkaJS restarts only retriable crashes. This safe wrapper intentionally
-    // has no cause so the original ClickHouse exception cannot leak to logs.
-    throw new KafkaJSError('ClickHouse batch insert failed', { retriable: true });
-  }
 }
 
 const invalidReasonNames: readonly InvalidReason[] = [
@@ -141,7 +82,11 @@ async function bootstrap(): Promise<void> {
       try {
         await processSpanBatch(messages, {
           insert: async (rows) => {
-            await insertWithHeartbeat(rows, heartbeat, () => isActive(isRunning, isStale));
+            await insertWithHeartbeat(rows, {
+              insert: async (batchRows) => clickhouse.insert({ table, values: batchRows, format: 'JSONEachRow' }),
+              heartbeat,
+              canContinue: () => isActive(isRunning, isStale),
+            });
           },
           commit: async (lastProcessedOffset, nextOffset) => {
             if (!isActive(isRunning, isStale)) return;
