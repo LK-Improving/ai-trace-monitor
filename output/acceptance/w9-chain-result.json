@@ -1,0 +1,23 @@
+{
+  "status": "passed",
+  "checks": [
+    "real HTTP/Kafka/Collector/ClickHouse",
+    "six concurrent trace trees",
+    "nested parent IDs",
+    "status 200/400/500",
+    "invalid ID replacement",
+    "privacy",
+    "health/ingest exclusions",
+    "trusted tenant binding",
+    "root-only overview counts",
+    "token counts without root duplication",
+    "environment isolation",
+    "Kafka outage and full queue preserve HTTP 200",
+    "observable queue drops",
+    "child logs contain no private canary or configured credentials"
+  ],
+  "cleanup": "passed",
+  "spanCount": 32,
+  "outageResponseMs": 33,
+  "cleanupFailures": []
+}

@@ -7,5 +7,6 @@ import { SpanKafkaQueue } from './span-kafka-queue.service';
 @Module({
   controllers: [SpansController],
   providers: [AdminTokenGuard, SpanIngestService, SpanKafkaQueue],
+  exports: [SpanKafkaQueue],
 })
 export class SpansModule {}

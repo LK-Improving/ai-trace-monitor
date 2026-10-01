@@ -1,0 +1,32 @@
+{
+  "status": "passed",
+  "inference": "local-protocol-fixtures-only",
+  "cleanup": "passed",
+  "checks": [
+    "six concurrent complete/stream calls",
+    "real local protocol HTTP requests",
+    "five-span nested trees",
+    "model and usage persisted",
+    "TTFT measures first content not role chunk",
+    "missing usage stays unavailable",
+    "safe rate-limit/timeout/cancellation categories",
+    "hashed RAG sources",
+    "content canary absent",
+    "overview root/token counts",
+    "disabled tracing preserves provider calls without spans",
+    "no payload or credentials in child logs"
+  ],
+  "providerCalls": {
+    "ragCalls": 10,
+    "llmCalls": 10
+  },
+  "spanCount": 50,
+  "metrics": {
+    "requestCount": 10,
+    "errorCount": 2,
+    "errorRate": 0.2,
+    "p95LatencyMs": 238.19999999999993,
+    "totalTokens": 180
+  },
+  "cleanupFailures": []
+}

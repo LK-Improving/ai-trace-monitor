@@ -440,12 +440,33 @@ interface FetchPatch {
 
 let fetchPatch: FetchPatch | undefined;
 
+const LOCAL_BROWSER_SPAN_TRANSPORT_PATH = '/__sdk_test__/spans';
+
+/** Return fetch below this SDK's wrapper, including when a transport module loads later. */
+export function getUnpatchedFetch(): typeof fetch | undefined {
+  const fetcher = fetchPatch?.original ?? globalThis.fetch;
+  return typeof fetcher === 'function' ? fetcher.bind(globalThis) : undefined;
+}
+
+/** The opt-in Span BFF request must bypass this monitor even if the transport captured its wrapper. */
+function isLocalBrowserSpanTransportRequest(input: RequestInfo | URL, init?: RequestInit): boolean {
+  if (requestMethod(input, init) !== 'POST') return false;
+  const url = getResolvedUrl(input);
+  return Boolean(url
+    && globalThis.location?.origin
+    && url.origin === globalThis.location.origin
+    && url.pathname === LOCAL_BROWSER_SPAN_TRANSPORT_PATH
+    && !url.search
+    && !url.hash);
+}
+
 function installFetchPatch(): () => void {
   if (fetchPatch) return () => undefined;
   const original = globalThis.fetch;
   if (typeof original !== 'function') return () => undefined;
 
   const wrapper: typeof fetch = function (this: typeof globalThis, input, init) {
+    if (isLocalBrowserSpanTransportRequest(input, init)) return original.call(this, input, init);
     const options = activeOptions;
     if (!options?.enabled || !isSameOrigin(input)) return original.call(this, input, init);
 

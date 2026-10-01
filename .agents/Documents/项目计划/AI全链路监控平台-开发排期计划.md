@@ -67,7 +67,7 @@
 | --- | --- | --- |
 | W9–W11 | 实现服务端 TraceRecorder：`start / set / setUsage / end`，父子 Span、状态、耗时和异常记录；定义 NestJS 接入方式 | API 请求产生 `http.server` root Span；异步发布不阻塞业务响应；服务、环境、Trace ID 字段一致 |
 | W11–W14 | 接入 OpenAI 兼容调用和 RAG 调用埋点；记录模型、Token、TTFT、错误分类、topK、sources、召回/重排耗时 | 同一请求至少含 `http.server`、`rag.retrieve`、`llm.generate` Span；模型 usage 与 RAG 属性在 ClickHouse 可查 |
-| W13–W16 | 实现 Trace 列表、详情 API 和 ClickHouse 查询：按项目、环境、Trace ID、服务、状态、时间分页过滤 | API 覆盖需求文档 `/traces` 与 `/traces/:traceId`；执行树父子关系、耗时和错误信息完整 |
+| W13–W16 | 实现 Trace 列表、详情  API 和 ClickHouse 查询：按项目、环境、Trace ID、服务、状态、时间分页过滤 | API 覆盖需求文档 `/traces` 与 `/traces/:traceId`；执行树父子关系、耗时和错误信息完整 |
 | W15–W18 | 建设聚合查询与 AI 链路指标：请求量、错误率、P50/P95/P99、Token、模型延迟、RAG 成功/空召回 | 常用时间范围的指标查询满足目标；列表查询 P95 < 2 秒、总览查询 P95 < 3 秒（测试数据集与口径需记录） |
 | W18–W20 | 将 Trace 和 AI 页面从 mock 切到 API；补齐项目 / 环境 / 时间筛选、空态、加载与错误处理 | **阶段门 G2**：接入示例应用后，可以从 Trace ID 看到完整 Span 树，并定位慢 Span、模型用量和 RAG 结果 |
 
@@ -173,3 +173,21 @@ Trace / 指标 / 告警查询 API ←──────────────�
 4. 明确上报 API、Trace 列表/详情 API、指标和告警 API 的请求响应契约，作为前后端并行依据。
 5. 先完成一条合成 Span 的 Kafka → Collector → ClickHouse 写入验收，再开始增加真实应用埋点。
 6. 建立最小自动化测试：Span schema / 脱敏、接口鉴权、重复消费/写入失败、Trace 树父子关系、TTL 配置。
+
+## 11. 执行进度（2026-09-30）
+
+W8 的本地 G1 功能闭环已通过真实验收：浏览器 SDK → API → Kafka → 已构建 Collector → ClickHouse → 基础总览页面。默认不上报、字段脱敏、请求统计口径、环境隔离及 30 天 TTL 表定义已检查。完整记录见 [W8-SDK闭环与独立验收](./W8-SDK闭环与独立验收.md)。
+
+遗留事项：当前 Node v20.0.0 环境中 Collector 源码/热更新启动尚未通过，不能将该结果视为 `pnpm dev` 全服务启动验收通过。本次仅认可已构建 Collector 的 G1 数据闭环；生产接入网关与 Phase 2/3 功能不在本轮交付范围。
+
+### Phase 2 W9–W11（2026-10-01）
+
+已完成服务端 TraceRecorder、AsyncLocalStorage 父子 Span、NestJS 根 Span 拦截器及可信项目/服务/环境绑定，默认关闭。两个 GPT-6-Luna Max 子代理按后端实际范围分别实现记录器和 Nest 接入，主代理独立审查并完成回归与真实管道验收。
+
+本轮 133 项测试通过；真实 HTTP → Kafka → Collector → ClickHouse 写入 32 个 Span，6 棵并发树父子关系正确，Overview 统计为 10 次请求、2 次错误、210 Token，故障队列不阻塞响应，隔离资源清理通过。详细边界和证据见 [W9-W11-服务端链路与独立验收](./W9-W11-服务端链路与独立验收.md)。本轮不代表 OpenAI/Qdrant 真实适配、Trace 查询或前端执行树已完成；下一步为 W11–W14。
+
+### Phase 2 W11–W14（2026-10-02）
+
+已实现 OpenAI 兼容普通/流式 HTTP 调用与 Qdrant Query Points 检索/回调重排埋点，记录模型、Token、TTFT、固定错误分类、topK、来源哈希及召回/重排耗时。两个 GPT-6-Luna Max 子代理分别实现模型与 RAG 后端，主代理完成共享接入、独立审查、修正和验收，无本轮前端修改。
+
+173 项测试、全仓构建和类型检查通过；真实 Kafka → Collector → ClickHouse 验收 50 个 Span，Overview 为 10 次请求、2 次错误、180 Token，隔离资源清理通过。调用使用本地 OpenAI/Qdrant 协议服务，不代表远程付费模型或真实 Qdrant 引擎召回质量已验收。详见 [W11-W14-模型与RAG适配及独立验收](./W11-W14-模型与RAG适配及独立验收.md)。Collector 原有 tsx watch 问题仍保留；下一步 W13–W16 Trace 列表/详情 API。

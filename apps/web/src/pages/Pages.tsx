@@ -1,46 +1,187 @@
 import { useMemo, useState } from 'react';
 import { agentRuns, mockAlerts, mockServices, mockTraces, modelUsage, ragRequests, traceSpans, type AlertLevel, type AlertState, type SpanRecord, type TraceRecord } from '../mock/data';
 import { Icon, PageIntro, PanelHeading, StatusPill } from '../components/ui';
-
-type PageName = 'overview' | 'traces' | 'ai' | 'alerts' | 'settings' | 'docs';
+import type { OverviewEnvironment, OverviewRange, OverviewResponse, OverviewService, OverviewSeriesPoint } from '../overview-api';
 
 function MetricCard({ label, value, detail, tone = 'blue', trend }: { label: string; value: string; detail: string; tone?: 'blue' | 'orange' | 'green'; trend?: string }) {
   return <article className="metric-card"><div className="metric-topline"><span className="metric-label">{label}</span><span className={`metric-swatch ${tone}`} /></div><div className="metric-bottom"><strong className="metric-value">{value}</strong>{trend && <span className={`metric-change ${tone === 'orange' ? 'down' : 'up'}`}>{trend}</span>}</div><p className="metric-detail">{detail}</p></article>;
 }
 
-function TrendChart() {
-  const requests = 'M44 155 L62 143 L80 151 L98 137 L116 148 L134 150 L152 132 L170 137 L188 126 L206 130 L224 111 L242 119 L260 97 L278 106 L296 122 L314 139 L332 124 L350 113 L368 119 L386 106 L404 110 L422 91 L440 84 L458 97 L476 69 L494 76 L512 49 L530 32 L548 61 L566 69 L584 75 L602 66 L620 89 L638 96 L656 105 L674 97 L692 109 L710 115 L728 129 L746 120 L764 133';
-  const errors = 'M44 207 L62 201 L80 205 L98 200 L116 208 L134 205 L152 211 L170 203 L188 212 L206 207 L224 209 L242 202 L260 208 L278 205 L296 213 L314 209 L332 216 L350 212 L368 218 L386 210 L404 213 L422 207 L440 214 L458 208 L476 210 L494 202 L512 206 L530 198 L548 193 L566 201 L584 164 L602 198 L620 205 L638 202 L656 210 L674 206 L692 212 L710 204 L728 209 L746 199 L764 193';
-  return <svg className="trend-chart" viewBox="0 0 800 260" preserveAspectRatio="none" role="img" aria-label="最近 24 小时请求量和错误率趋势">
-    {[25, 64, 103, 142, 181, 220].map((y) => <line key={`h${y}`} className="grid-line" x1="44" y1={y} x2="764" y2={y} />)}
-    {[44, 188, 332, 476, 620, 764].map((x) => <line key={`v${x}`} className="grid-line vertical" x1={x} y1="25" x2={x} y2="220" />)}
-    {['2,500', '2,000', '1,500', '1,000', '500', '0'].map((label, index) => <text key={label} className="axis-label left" x="37" y={28 + index * 39}>{label}</text>)}
-    {['04:00', '08:00', '12:00', '16:00', '20:00', '00:00'].map((label, index) => <text key={label} className="axis-label time" x={44 + index * 144} y="248">{label}</text>)}
-    <path className="chart-line requests" d={requests} /><path className="chart-line errors" d={errors} />
+function formatCount(value: number): string {
+  return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 0 }).format(value);
+}
+
+function formatTokens(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toLocaleString('zh-CN', { maximumFractionDigits: 2 })}M`;
+  if (value >= 10_000) return `${(value / 1_000).toLocaleString('zh-CN', { maximumFractionDigits: 1 })}K`;
+  return formatCount(value);
+}
+
+function formatPercent(value: number): string {
+  return `${(value * 100).toLocaleString('zh-CN', { maximumFractionDigits: 2 })}%`;
+}
+
+function formatLatency(value: number): string {
+  return value >= 1000
+    ? `${(value / 1000).toLocaleString('zh-CN', { maximumFractionDigits: 2 })}s`
+    : `${Math.round(value)}ms`;
+}
+
+function formatTimestamp(value: string, range: OverviewRange): string {
+  const options: Intl.DateTimeFormatOptions = range === '7d'
+    ? { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }
+    : { hour: '2-digit', minute: '2-digit' };
+  return new Intl.DateTimeFormat('zh-CN', options).format(new Date(value));
+}
+
+function getEnvironmentLabel(environment: OverviewEnvironment): string {
+  switch (environment) {
+    case 'dev': return 'development';
+    case 'staging': return 'staging';
+    case 'prod': return 'production';
+    case 'all': return '全部环境';
+  }
+}
+
+function getRangeLabel(range: OverviewRange): string {
+  if (range === '1h') return '最近 1 小时';
+  if (range === '7d') return '最近 7 天';
+  return '最近 24 小时';
+}
+
+function niceCeiling(value: number): number {
+  if (value <= 0) return 1;
+  const magnitude = 10 ** Math.floor(Math.log10(value));
+  return Math.ceil(value / magnitude) * magnitude;
+}
+
+function formatBucket(value: string, range: OverviewRange): string {
+  const options: Intl.DateTimeFormatOptions = range === '7d'
+    ? { month: 'numeric', day: 'numeric', hour: '2-digit' }
+    : { hour: '2-digit', minute: '2-digit' };
+  return new Intl.DateTimeFormat('zh-CN', options).format(new Date(value));
+}
+
+function TrendChart({ series, range }: { series: OverviewSeriesPoint[]; range: OverviewRange }) {
+  const left = 54;
+  const right = 752;
+  const top = 25;
+  const bottom = 218;
+  const width = right - left;
+  const height = bottom - top;
+  const points = [...series].sort((a, b) => Date.parse(a.bucketStart) - Date.parse(b.bucketStart));
+  const requestMax = niceCeiling(Math.max(4, ...points.map((point) => point.requestCount)));
+  const rateMax = Math.max(0.01, niceCeiling(Math.max(...points.map((point) => point.errorRate)) * 100) / 100);
+  const x = (index: number) => points.length < 2 ? left + width / 2 : left + (index / (points.length - 1)) * width;
+  const requestY = (value: number) => bottom - (value / requestMax) * height;
+  const errorY = (value: number) => bottom - (value / rateMax) * height;
+  const requestPath = points.map((point, index) => `${index === 0 ? 'M' : 'L'} ${x(index)} ${requestY(point.requestCount)}`).join(' ');
+  const errorPath = points.map((point, index) => `${index === 0 ? 'M' : 'L'} ${x(index)} ${errorY(point.errorRate)}`).join(' ');
+  const tickIndexes = [...new Set([0, Math.round((points.length - 1) / 4), Math.round((points.length - 1) / 2), Math.round((points.length - 1) * 3 / 4), points.length - 1])];
+
+  return <svg className="trend-chart" viewBox="0 0 800 260" preserveAspectRatio="none" role="img" aria-label={`${range} 请求量与错误率趋势`}>
+    {[0, 1, 2, 3, 4].map((tick) => {
+      const y = top + (height * tick) / 4;
+      const ratio = 1 - tick / 4;
+      return <g key={tick}>
+        <line className="grid-line" x1={left} y1={y} x2={right} y2={y} />
+        <text className="axis-label left" x={left - 8} y={y + 3}>{formatCount(requestMax * ratio)}</text>
+        <text className="axis-label right" x={right + 8} y={y + 3}>{formatPercent(rateMax * ratio)}</text>
+      </g>;
+    })}
+    {tickIndexes.map((index) => <g key={index}>
+      <line className="grid-line vertical" x1={x(index)} y1={top} x2={x(index)} y2={bottom} />
+      <text className="axis-label time" x={x(index)} y="246">{formatBucket(points[index].bucketStart, range)}</text>
+    </g>)}
+    <path className="chart-line requests" d={requestPath} />
+    <path className="chart-line errors" d={errorPath} />
   </svg>;
 }
 
-export function OverviewPage({ onNavigate, onSelectTrace, environment }: { onNavigate: (page: PageName) => void; onSelectTrace: (id: string) => void; environment: string }) {
-  const visibleTraces = mockTraces.filter((trace) => environment === '全部环境' || trace.environment === environment);
-  const visibleAlerts = mockAlerts.filter((alert) => alert.state !== 'resolved' && (environment === '全部环境' || alert.environment === environment));
+function OverviewMessage({ children, loading = false }: { children: string; loading?: boolean }) {
+  return <div className={`overview-panel-message ${loading ? 'loading' : ''}`} role={loading ? 'status' : undefined}>{children}</div>;
+}
+
+function serviceState(service: OverviewService): { tone: 'ok' | 'warning' | 'muted'; label: string } {
+  if (service.status === 'healthy') return { tone: 'ok', label: '正常' };
+  if (service.status === 'degraded') return { tone: 'warning', label: '需关注' };
+  return { tone: 'muted', label: '暂无数据' };
+}
+
+export function OverviewPage({
+  status,
+  errorMessage,
+  data,
+  environment,
+  range,
+  empty,
+  onRetry,
+  onSelectTrace,
+}: {
+  status: 'loading-projects' | 'project-error' | 'no-projects' | 'loading' | 'error' | 'ready';
+  errorMessage?: string;
+  data?: OverviewResponse;
+  environment: OverviewEnvironment;
+  range: OverviewRange;
+  empty: boolean;
+  onRetry: () => void;
+  onSelectTrace: (id: string) => void;
+}) {
+  const metric = status === 'ready' ? data?.metrics : undefined;
+  const demoEnvironment = environment === 'prod' ? 'production' : environment === 'dev' ? 'development' : environment;
+  const demoTraces = mockTraces
+    .filter((trace) => environment === 'all' || trace.environment === demoEnvironment)
+    .slice(0, 5);
+  const statusCopy: Record<typeof status, string> = {
+    'loading-projects': '正在读取项目列表…',
+    'project-error': errorMessage ?? '项目列表加载失败。',
+    'no-projects': '当前没有可用项目，请先配置项目后再查看监控数据。',
+    loading: '正在加载所选项目的 Overview 数据…',
+    error: errorMessage ?? 'Overview 数据加载失败。',
+    ready: empty ? '该项目、环境与时间范围内暂无观测数据。' : '',
+  };
+  const isError = status === 'error' || status === 'project-error';
+  const canRetry = isError || status === 'no-projects';
+  const panelMessage = status === 'ready'
+    ? '暂无数据'
+    : status === 'loading' || status === 'loading-projects' ? '正在读取…' : '数据暂不可用';
+
   return <>
-    <section className="metric-grid" aria-label="关键指标">
-      <MetricCard label="请求量" value="48,291" detail="过去 24 小时 · 较前一周期" trend="↑ 12.4%" />
-      <MetricCard label="错误率" value="0.82%" detail="目标低于 1.00%" tone="orange" trend="↓ 0.3%" />
-      <MetricCard label="P95 延迟" value="1.68s" detail="过去 24 小时 · 较前一周期" tone="green" trend="↓ 12.1%" />
-      <MetricCard label="Token 消耗" value="2.64M" detail="估算成本 $164.40" trend="↑ 18.7%" />
+    {statusCopy[status] && <div className={`overview-status ${isError ? 'error' : status === 'ready' ? 'empty' : 'info'}`} role={isError ? 'alert' : 'status'} aria-live="polite">
+      <span>{statusCopy[status]}</span>
+      {canRetry && <button className="text-action" type="button" onClick={onRetry}>{status === 'no-projects' ? '重新加载项目' : '重试'}<Icon name="arrow" size={14} /></button>}
+    </div>}
+
+    <section className="metric-grid" aria-label="关键指标" aria-busy={status === 'loading' || status === 'loading-projects'}>
+      <MetricCard label="请求量" value={metric ? formatCount(metric.requestCount) : '—'} detail={metric ? `${formatCount(metric.errorCount)} 次错误 · ${getRangeLabel(range)}` : panelMessage} />
+      <MetricCard label="错误率" value={metric ? formatPercent(metric.errorRate) : '—'} detail={metric ? '请求 Span 口径 · 不含前端诊断事件' : panelMessage} tone="orange" />
+      <MetricCard label="P95 延迟" value={metric ? formatLatency(metric.p95LatencyMs) : '—'} detail={metric ? `环境：${getEnvironmentLabel(environment)}` : panelMessage} tone="green" />
+      <MetricCard label="Token 消耗" value={metric ? formatTokens(metric.totalTokens) : '—'} detail={metric ? '输入与输出 Token 合计' : panelMessage} />
     </section>
 
     <section className="primary-grid">
-      <article className="panel chart-panel"><div className="panel-heading chart-heading"><h2>请求与错误率</h2><div className="legend"><span><i className="legend-dot requests-dot" />请求量</span><span><i className="legend-dot errors-dot" />错误率</span></div></div><div className="chart-wrap"><TrendChart /></div></article>
-      <article className="panel alerts-panel"><PanelHeading title="待处理告警" action="查看全部" onAction={() => onNavigate('alerts')} /><div className="alert-list">
-        {visibleAlerts.slice(0, 3).map((alert) => <button className="alert-row" key={alert.id} type="button" onClick={() => onNavigate('alerts')}><i className={`severity-dot ${alert.level}`} /><span className="alert-copy"><strong>{alert.title}</strong><small>{alert.service}<i />{alert.time}</small></span><span className={`severity-label ${alert.level}`}>{alert.level === 'critical' ? '严重' : alert.level === 'warning' ? '警告' : '提示'}</span></button>)}
+      <article className="panel chart-panel"><div className="panel-heading chart-heading"><h2>请求与错误率</h2><div className="legend"><span><i className="legend-dot requests-dot" />请求量</span><span><i className="legend-dot errors-dot" />错误率</span></div></div><div className="chart-wrap">
+        {status === 'ready' && data?.series.length ? <TrendChart series={data.series} range={range} /> : <OverviewMessage loading={status === 'loading' || status === 'loading-projects'}>{status === 'ready' ? '当前时间范围内暂无趋势数据' : panelMessage}</OverviewMessage>}
+      </div></article>
+      <article className="panel alerts-panel"><PanelHeading title="最近错误" aside={<span className="muted-caption">Overview 接口</span>} /><div className="recent-error-list">
+        {status === 'ready' && data?.recentErrors.length ? data.recentErrors.slice(0, 5).map((error, index) => <article className="recent-error-row" key={`${error.traceId}-${error.startTime}-${error.service}-${error.operation}-${index}`}>
+          <i className="severity-dot critical" />
+          <span className="recent-error-copy"><strong>{error.service}</strong><small title={error.operation}>{error.operation}<i />{formatTimestamp(error.startTime, range)}</small><code title={error.traceId}>{error.traceId}</code></span>
+          <span className="recent-error-duration">{formatLatency(error.durationMs)}</span>
+        </article>) : <OverviewMessage loading={status === 'loading' || status === 'loading-projects'}>{status === 'ready' ? '此时间范围内暂无错误' : panelMessage}</OverviewMessage>}
       </div></article>
     </section>
 
     <section className="secondary-grid">
-      <article className="panel table-panel"><PanelHeading title="服务状态" action="查看服务" onAction={() => onNavigate('settings')} /><div className="table-scroll"><table><thead><tr><th>服务</th><th>请求量</th><th>错误率</th><th>P95</th><th>状态</th></tr></thead><tbody>{mockServices.slice(0, 3).map((service) => <tr key={service.name}><td className="service-name">{service.name}</td><td>{service.requests}</td><td>{service.errors}</td><td>{service.latency}</td><td><StatusPill status={service.tone === 'warning' ? 'warning' : 'ok'}>{service.status}</StatusPill></td></tr>)}</tbody></table></div><div className="table-caption">当前环境：{environment}</div></article>
-      <article className="panel table-panel traces-panel"><PanelHeading title="最新 Traces" action="查看全部" onAction={() => onNavigate('traces')} /><div className="table-scroll"><table><thead><tr><th>Trace ID</th><th>服务</th><th>耗时</th><th>状态</th><th>时间</th></tr></thead><tbody>{visibleTraces.slice(0, 5).map((trace) => <tr key={trace.id}><td><button className="trace-id" type="button" onClick={() => onSelectTrace(trace.id)}>{trace.id.slice(0, 8)}…</button></td><td>{trace.service}</td><td>{trace.duration}</td><td><StatusPill status={trace.status === 'error' ? 'error' : 'ok'}>{trace.status === 'error' ? '错误' : '成功'}</StatusPill></td><td>{trace.time.slice(0, 5)}</td></tr>)}</tbody></table></div></article>
+      <article className="panel table-panel"><PanelHeading title="服务状态" aside={status === 'ready' && data ? <span className="muted-caption">{data.services.length} 个服务 · API 数据</span> : undefined} /><div className="table-scroll"><table><thead><tr><th>服务</th><th>Span / 事件数</th><th>异常占比</th><th>P95</th><th>状态</th></tr></thead><tbody>
+        {status === 'ready' && data?.services.length ? data.services.slice(0, 5).map((service) => {
+          const state = serviceState(service);
+          return <tr key={service.name}><td className="service-name">{service.name}<small className="service-last-seen">最近上报：{service.lastSeenAt ? formatTimestamp(service.lastSeenAt, range) : '—'}</small></td><td>{formatCount(service.requestCount)}</td><td>{formatPercent(service.errorRate)}</td><td>{formatLatency(service.p95LatencyMs)}</td><td><StatusPill status={state.tone}>{state.label}</StatusPill></td></tr>;
+        }) : <tr><td colSpan={5} className="overview-table-empty">{status === 'ready' ? '暂无服务数据' : panelMessage}</td></tr>}
+      </tbody></table></div><div className="table-caption">环境：{getEnvironmentLabel(environment)} <span>·</span> 数据来自当前筛选条件</div></article>
+      <article className="panel table-panel traces-panel"><PanelHeading title="最新 Traces" aside={<span className="muted-caption">演示数据</span>} /><div className="table-scroll"><table><thead><tr><th>Trace ID</th><th>服务</th><th>耗时</th><th>状态</th><th>时间</th></tr></thead><tbody>
+        {demoTraces.length > 0 ? demoTraces.map((trace) => <tr key={trace.id}><td><button className="trace-id" type="button" onClick={() => onSelectTrace(trace.id)}>{trace.id.slice(0, 8)}…</button></td><td>{trace.service}</td><td>{trace.duration}</td><td><StatusPill status={trace.status === 'error' ? 'error' : 'ok'}>{trace.status === 'error' ? '错误' : '成功'}</StatusPill></td><td>{trace.time.slice(0, 5)}</td></tr>) : <tr><td colSpan={5} className="overview-table-empty">该环境暂无演示 Trace</td></tr>}
+      </tbody></table></div><div className="table-caption">Trace 检索接入后将替换为真实数据</div></article>
     </section>
   </>;
 }

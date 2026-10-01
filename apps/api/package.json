@@ -10,6 +10,7 @@
     "test": "pnpm run build && node --test"
   },
   "dependencies": {
+    "@clickhouse/client": "^1.11.2",
     "@nestjs/common": "^11.0.0",
     "@nestjs/config": "^4.0.0",
     "@nestjs/core": "^11.0.0",

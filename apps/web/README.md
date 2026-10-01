@@ -35,12 +35,26 @@ monitor.teardown();
 - Web Vitals 使用 GoogleChrome/web-vitals 官方 `onCLS`、`onINP`、`onLCP`、`onFCP`、`onTTFB` 回调，只读取指标名、数值、变化量、评级和安全格式的指标 ID；不读取 performance entries 或 DOM attribution。
 - Web Vitals API 没有 observer teardown。SDK 每个页面生命周期最多注册一组观察器；teardown 后回调不再转发，重启时复用该组观察器。
 
-## 当前边界
+## 可选 Browser Span relay（W8）
 
-当前事件只交给接入方传入的 `onEvent` / `transport`；它们尚未上报到平台后端。W4 起才实现 Span ingest、Kafka Producer 和 Collector 数据闭环。本 SDK 本轮也不生成或发送 Span、项目密钥、API 凭证，也不实现业务操作的异步 Trace 上下文绑定。
+核心 SDK 默认仍只把安全事件交给接入方的 `onEvent` / `transport`。独立的 `src/browser-span-transport.ts` 可由接入方显式创建，把固定服务 `web-sdk-demo`、环境 `dev` 的 SDK 事件转成 Browser Span；它不是生产网关，也不会创建、读取或暴露 projectKey、PLATFORM_ADMIN_TOKEN 或 Authorization。验收页的“上报到本地平台”默认关闭，只有勾选后启动 SDK 才创建 relay。
+
+Relay 只接受无 query/hash 的同源 endpoint，验收页固定使用 `POST /__sdk_test__/spans`。本地 Vite `configureServer` 通过根目录 `scripts/browser-span-relay.cjs` 提供此同源 BFF 路由；其他宿主需提供等价的 caller-owned BFF。浏览器请求 JSON 严格为 `{ environment: 'dev', spans: [...] }`，Span 仅含 `traceId`、`spanId`、`service`、`operation`、`startTime`、`endTime`、`status`、`attributes`。operation 固定映射为 `browser.web_vital`、`browser.javascript_error`、`browser.unhandled_rejection` 或 `browser.network_error`，且必须与 `attributes.eventType` 一致。属性只允许定义的安全诊断字段；原文 message、metricId、body、headers、parent ID 和 token usage 不发送。传入事件必须已属于 `web-sdk-demo` / `dev`，路径还会经过 relay 的白名单校验；Web Vital value 必须非负，delta 允许有符号并遵循 relay 的数值上限。
+
+队列上限 100，单请求最多 20 个 Span，自动 flush 每秒一次；“立即上报”可立即启动 flush，并在一个 flush 中分批发送。单次请求超时 3 秒。失败的批次不重试；非 HTTP 202、超时和网络失败只增加失败计数，不抛到业务调用，也不会由 SDK 再捕获。Relay 在 SDK 启动前解析未包装的 fetch，`api.ts` 还仅对固定的同源 `POST /__sdk_test__/spans` 做递归保护。请求不带 Authorization，并使用 `credentials: 'omit'`。验收页只把 HTTP 202 显示为“API内存排队”，它表示 API 进程内存队列已接收，不代表持久写入或 Collector 入库；停止时清空待发队列、取消进行中的请求并 dispose，同时保留计数供检查。
+
+该 relay 是一个可选的浏览器到宿主 BFF 接口示例，不是生产网关，也不替代应用自己的认证、生产反向代理或凭证管理。启动开发服务前在服务端进程设置 `SDK_TEST_PROJECT_KEY`。该密钥只供服务端 relay 使用，不能设置为 `VITE_*`，不会进入浏览器 Bundle 或 Span 请求体；服务端 relay 再使用此密钥转发到 API。未配置时 relay 会失败关闭；默认关闭状态不会发出上报请求。
+
+## Overview 控制台（Phase 1 W7）
+
+运行仓库根目录的 `pnpm dev` 时，暖白色总览页会通过 `/api/v1/projects` 和 `/api/v1/overview` 读取项目、指标、趋势、服务状态与最近错误。前端请求只走同源 `/api`；Vite 开发服务器仅为这两个只读 GET 路由从进程环境中的 `PLATFORM_ADMIN_TOKEN` 注入 Bearer 令牌。令牌不进入浏览器 Bundle、`VITE_*` 配置或存储。若未配置令牌或 API 不可用，页面显示明确错误，不回退为假实时数据。
+
+此 Vite 代理仅用于本地开发。部署生产控制台时，必须配置可信的服务端反向代理/BFF 或用户登录与权限体系；不要把平台管理员令牌发给浏览器。Overview 的“最新 Traces”、Trace 检索、AI 链路和告警中心仍是带有“演示数据”标识的原型数据，待相应 API 阶段接入。
+
+开发代理跟随进程环境中的 `API_PORT`（默认 3001）。若该端口被其他项目占用，可在根目录 `.env` 中设置其他端口后重启 `pnpm dev`；API 与前端代理会使用相同端口。请用 `http://127.0.0.1:5173/` 访问，避免 `localhost` 解析到其他应用占用的 IPv6 监听地址。
 
 ## 本地浏览器验收页
 
-执行 `pnpm --filter @trace-ops/web dev` 后打开 `http://localhost:5173/sdk-test.html`。先点击“启动 SDK”，再触发同源 HTTP 失败、合成 JavaScript Error 或合成 Promise rejection；事件列表会显示本地 `onEvent` 收到的脱敏字段，并检查 Trace ID 格式和固定合成标记是否进入事件。
+执行 `pnpm --filter @trace-ops/web dev` 后打开 `http://127.0.0.1:5173/sdk-test.html`。默认不勾选“上报到本地平台”：启动 SDK 并触发同源 HTTP 失败、合成 JavaScript Error、合成 Promise rejection 后，事件只进入本地 `onEvent`。Web Vitals 仍由 SDK 的官方 observer 正常采集；上报开关关闭时不会因此产生平台请求。
 
-HTTP 场景只请求 Vite 提供的 `GET /__sdk_test__/http-error` 本地 503 fixture，query 中仅放固定合成隐私标记；不访问 API 或管理路由，不带请求体和 Authorization，也不会读取响应体。JS / Promise 场景通过合成浏览器事件触发，不制造真实未处理异常。事件只保存在当前页面内存，页面没有配置 `transport`，不使用 `localStorage`，也不会提交 Prompt、Response 或用户原文。
+HTTP 场景只请求 Vite 提供的 `GET /__sdk_test__/http-error` 本地 503 fixture，query 中仅放固定合成隐私标记；不访问 API 或管理路由，不带请求体和 Authorization，也不会读取响应体。JS / Promise 场景通过合成浏览器事件触发，不制造真实未处理异常。启用平台 relay 需明确勾选并重启；“立即上报”可发送当前内存队列，停止会清空队列并保留 disposal 计数。页面不使用 `localStorage`，也不会提交 Prompt、Response 或用户原文。

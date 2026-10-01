@@ -1,6 +1,6 @@
 # API 服务
 
-NestJS API 监听 `API_PORT`（默认 `3001`），路由前缀为 `/api/v1`。当前包含公开健康检查、项目管理最小 API，以及每个请求的 `x-trace-id` 解析和响应回传。
+NestJS API 监听 `API_PORT`（默认 `3001`），路由前缀为 `/api/v1`。当前包含公开健康检查、项目管理最小 API、基础 Overview 查询，以及每个请求的 `x-trace-id` 解析和响应回传。
 
 ## 本地配置
 
@@ -20,13 +20,14 @@ HTTP 202 的 `delivery: "queued_in_memory"` 仅表示数据进入有界内存队
 
 ## 管理 API
 
-所有项目、服务、环境和密钥路由均要求管理员令牌。
+所有项目、服务、环境、密钥和 Overview 路由均要求管理员令牌。Overview 当前只读 ClickHouse 与项目/服务元数据；它不返回错误原文或 Span `attributes`。
 
-该令牌是平台级管理凭证，只能由可信服务端持有。当前 Web 不应直接调用这些受保护路由，也不能把令牌放进 `VITE_*` 配置；控制台联调前需确定服务端代理/BFF 或正式的用户身份与权限方案。
+该令牌是平台级管理凭证，只能由可信服务端持有。Web 浏览器不得直接持有该令牌，也不能把令牌放进 `VITE_*` 配置。当前本地开发由 Vite 服务端代理为 Overview 所需的两个只读 GET 路由注入令牌；生产部署仍需可信反向代理/BFF 或正式的用户身份与权限方案。
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | `GET` | `/api/v1/projects` | 项目列表 |
+| `GET` | `/api/v1/overview?projectId=<uuid>&environment=all&range=24h` | 总览指标、趋势、服务健康和最近错误；环境可选 `dev` / `staging` / `prod` / `all`，时间范围可选 `1h` / `24h` / `7d` |
 | `POST` | `/api/v1/projects` | 创建项目：`{ "name": "客服智能体", "slug": "support-agent" }`；`retentionDays` 可选，默认 30 |
 | `GET` | `/api/v1/projects/:projectId/services` | 项目服务列表 |
 | `POST` | `/api/v1/projects/:projectId/services` | 注册服务：`{ "name": "api", "environment": "dev", "sdkVersion": "1.0.0" }` |
@@ -37,10 +38,64 @@ HTTP 202 的 `delivery: "queued_in_memory"` 仅表示数据进入有界内存队
 
 环境只接受 `dev`、`staging`、`prod`。项目/服务/密钥创建严格拒绝未声明字段；项目 slug 唯一，服务按现有表约束以项目、名称、环境组合唯一。项目密钥格式为 `tr_` + 32 字节 Base64URL；数据库只保存 SHA-256 Hash 与用于识别的前缀，Scope 固定为 `spans:write`。
 
+Overview 的全局请求量、错误数、P95 与趋势按根 Span（`parent_span_id = ''`）统计，排除 `browser.web_vital`、`browser.javascript_error`、`browser.unhandled_rejection` 这些非请求诊断事件，避免把性能事件或同一 Trace 的 RAG/LLM 子 Span 重复算成多次请求。`browser.network_error` 记录失败的网络请求，参与该指标；当前 SDK 不采集成功网络请求，因此仅有浏览器事件的项目不应把该错误率视为全站请求错误率。Token 合计只统计带模型标识或 `llm.generate` 操作的 Span，避免根 Span 复制 Token 用量造成双计。服务状态按全部服务 Span/事件聚合：错误率达到 1% 为 `degraded`，窗口内没有 Span 为 `no_data`。该阈值用于当前 MVP 展示，后续规则配置化另行排期。
+
 ## Trace ID
 
 API 接收单个符合 W1 格式的 `x-trace-id` 时沿用该值；缺失、格式无效或重复/歧义时生成 `trace_v1_<UUID>`。请求 Body 不参与 Trace ID 解析。中间件会在路由执行前设置响应头，因此成功和异常响应都会带 `x-trace-id`；CORS 同时暴露该响应头。
 
-## 测试
+## W9–W11 服务端链路记录
+
+已加入框架独立的 `src/observability/trace-recorder.ts` 和 NestJS `ObservabilityModule`。平台 API 默认关闭服务端埋点，避免未绑定租户就写入监控数据。先在项目中注册服务和环境，再设置服务端配置并重启 API：
+
+```dotenv
+SERVER_TRACE_ENABLED=true
+SERVER_TRACE_PROJECT_ID=<已注册项目 UUID>
+SERVER_TRACE_SERVICE=<已注册服务名>
+SERVER_TRACE_ENVIRONMENT=dev
+```
+
+这些值只能来自可信服务端配置，不能从请求 body、租户 header 或浏览器 `VITE_*` 配置取得。启动时进行一次限时注册校验；配置错误、未注册或 PostgreSQL 不可用时停用埋点，不阻止 API 启动。`GET /api/v1/health` 的 `tracing.state` 显示 `disabled / ready / invalid_configuration / unregistered_binding / dependency_unavailable`；修复配置或注册后需要重启。运行期注册状态变更暂不热更新，正式多租户接入需在可信网关实时鉴权，此静态绑定不是客户端上报鉴权的替代。
+
+启用后，经过 NestJS 拦截器的请求产生 `http.server` 根 Span，继承 middleware 解析的 `x-trace-id`，在响应 `finish` 或提前 `close` 时结束并写入现有有界队列。不等待 Kafka 连接、发送或 ClickHouse 写入。健康检查与整个 `/spans` 接入/状态路径排除，避免监控自己的上报造成递归。Nest Guard 拒绝、找不到路由、body parser 提前拒绝发生在拦截器之前，当前只返回 Trace ID，不产生根 Span；此边界不应被误解为覆盖所有入口失败。
+
+业务模块导入 `ObservabilityModule` 并注入 `TraceContext`，可自动继承上下文：
+
+```typescript
+await this.traceContext.withSpan('rag.retrieve', async span => {
+  const documents = await this.retriever.retrieve(question);
+  span.set('topK', documents.length);
+  return documents;
+});
+```
+
+`withSpan` 仅在有效上下文中使用；监控关闭时可先判断 `this.traceContext.current()` 并直接执行原业务。独立调用 `new TraceRecorder(binding, sink)` 支持 `start(operation, traceId, parentSpanId?)`、`set`、`setUsage`、同步幂等 `end(error?)`。Sink 应只同步排队，不能在回调中做同步 I/O；异步 sink 的 rejection 与同步抛错会被隔离，调用方仍应使用有界队列。属性会脱敏、限制大小并生成不可共享的快照；`set` 和 `setUsage` 的无效开发参数会抛错。异常只保留固定安全分类和状态，不记录原始 message、stack、Prompt 或 Response。属性过滤不能识别所有伪装在普通字段中的用户原文，调用方必须只写安全元数据。
+
+W9–W11 交付记录器与接入基础；后续 W11–W14 调用适配见下节。模型定价、Trace 查询和执行树页面仍按后续排期实现。隔离验收控制器只位于 `scripts/`，不会被生产 API 引入。
+
+运行全工作区构建后，可显式执行真实链路验收：
+
+```powershell
+$env:TRACE_OPS_RUN_INTEGRATION = '1'
+node scripts/w9-chain-acceptance.cjs
+```
+
+脚本仅连接本机依赖，创建并清理独立项目、Topic、消费组和本次进程；安全结果在 `output/acceptance/w9-chain-result.json`。Collector 使用已构建入口；当前环境 `tsx watch` 的源码加载问题不属于本轮已验证的热更新能力。
+
+## W11–W14：模型与 RAG 调用适配
+
+业务模块导入 `ObservabilityModule` 并注入 `AiAdaptersService`，通过 `llm().complete({ model, messages, signal? })`、`llm().stream(...)` 或 `rag().retrieve({ vector, topK, signal?, rerank? })` 发起真实 HTTP 调用。客户端按需创建；没有 Trace 上下文或关闭监控时仍执行原业务。平台不新增公开模型代理接口，测试控制器只在 `scripts/w11-fixture-server.cjs`。
+
+根目录 `.env.example` 中的 `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_TIMEOUT_MS` 与 `RAG_QDRANT_URL`、`RAG_QDRANT_COLLECTION`、`RAG_QDRANT_API_KEY`、`RAG_TIMEOUT_MS` 只用于可信服务端。缺少配置只在使用该客户端时失败，不阻止 API 启动。不要使用 `VITE_*` 或提交真实凭证。远程端点必须 HTTPS；纯 HTTP 仅允许 loopback，容器内部明文域名暂不接受。禁止 URL 内嵌凭证、查询参数和重定向，不自动重试付费调用。默认总超时 30 秒，允许整数 100–120000 毫秒。
+
+LLM 产生 `llm.generate`，记录请求/返回模型、安全结束原因、总耗时、usage 可用标记及 Token。流式 TTFT 从首个非空内容 delta 计算，不把角色或响应头当首 Token；普通调用不伪造 TTFT。缺失 usage 保持未知，输入输出为非负安全整数，提供的总数必须等于两者之和。流中途关闭、超时和协议不完整为失败；已收到的 usage 是部分可用数据，不表示调用成功。消费方应使用 `for await` 或显式 `return()` 关闭迭代器，不能遗弃未关闭的迭代器。
+
+RAG 使用 Qdrant Query Points API；`rag.retrieve` 下包含 `rag.recall` 和可选 `rag.rerank`。记录 topK、召回数量、空召回、SHA-256 文档 ID 标识及召回/重排耗时。排名快照最多各 20 条，保留总数和截断标记，业务 topK 上限仍为 100。重排回调只允许已有文档重排、调整分数或取子集，不能引入新 ID；接收 AbortSignal，总超时不因回调忽略取消而无限等待。超时不能强制停止回调内部副作用，回调实现仍需协作取消。向量生成和重排模型不在该适配器内实现。
+
+Prompt、回答、向量、文档正文/URL、原始异常和密钥不写入监控；业务返回仍包含模型内容和 Qdrant payload。哈希是关联标识，不是加密或不可逆匿名化承诺。错误分类固定为限流、超时、认证、内容过滤、提供方、网络、协议、取消或输入无效。
+
+协议参考：[OpenAI Chat](https://developers.openai.com/api/reference/resources/chat)、[Qdrant Query Points](https://api.qdrant.tech/api-reference/search/query-points)。运行构建后，可用 `$env:TRACE_OPS_RUN_INTEGRATION = '1'` 和 `node scripts/w11-chain-acceptance.cjs` 验证本地协议服务 → API → Kafka → Collector → ClickHouse。该验收不调用付费模型，也不证明真实 Qdrant 引擎召回质量；结果和清理记录在 `output/acceptance/w11-chain-result.json`。
+
+## 单元测试
 
 运行 `pnpm --filter @trace-ops/api test`。测试使用 Node 内置 `node:test`，管理逻辑通过 mock 数据库覆盖，不连接或修改 PostgreSQL。

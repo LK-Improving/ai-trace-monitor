@@ -2,6 +2,8 @@ import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { DatabaseModule } from './database/database.module';
 import { HealthController } from './health/health.controller';
+import { OverviewModule } from './overview/overview.module';
+import { ObservabilityModule } from './observability/observability.module';
 import { ProjectsModule } from './projects/projects.module';
 import { SpansModule } from './spans/spans.module';
 import { TraceIdMiddleware } from './trace/trace-id.middleware';
@@ -11,7 +13,9 @@ import { TraceIdMiddleware } from './trace/trace-id.middleware';
     ConfigModule.forRoot({ isGlobal: true, envFilePath: '../../.env' }),
     DatabaseModule,
     ProjectsModule,
+    OverviewModule,
     SpansModule,
+    ObservabilityModule,
   ],
   controllers: [HealthController],
 })

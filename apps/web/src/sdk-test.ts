@@ -5,6 +5,14 @@ import {
   teardownBrowserMonitoring,
   type BrowserMonitorEvent,
 } from './api';
+import {
+  BROWSER_SPAN_ENDPOINT,
+  BROWSER_SPAN_ENVIRONMENT,
+  BROWSER_SPAN_SERVICE,
+  createBrowserSpanTransport,
+  type BrowserSpanTransport,
+  type BrowserSpanTransportStatus,
+} from './browser-span-transport';
 import './sdk-test.css';
 
 const PRIVACY_CANARY = 'sdk_local_fixture_not_collected_7f3a';
@@ -15,6 +23,10 @@ const startButton = document.querySelector<HTMLButtonElement>('#start-sdk')!;
 const stopButton = document.querySelector<HTMLButtonElement>('#stop-sdk')!;
 const captureErrors = document.querySelector<HTMLInputElement>('#capture-errors')!;
 const captureVitals = document.querySelector<HTMLInputElement>('#capture-vitals')!;
+const serverRelay = document.querySelector<HTMLInputElement>('#server-relay')!;
+const flushButton = document.querySelector<HTMLButtonElement>('#flush-spans')!;
+const transportState = document.querySelector<HTMLElement>('#transport-state')!;
+const transportDetail = document.querySelector<HTMLElement>('#transport-detail')!;
 const statePill = document.querySelector<HTMLElement>('#sdk-state')!;
 const stateText = statePill.querySelector<HTMLSpanElement>('span')!;
 const traceIdElement = document.querySelector<HTMLElement>('#current-trace-id')!;
@@ -28,6 +40,8 @@ const allScenarioButtons = [...document.querySelectorAll<HTMLButtonElement>('.sc
 const events: BrowserMonitorEvent[] = [];
 let running = false;
 let currentTraceId = '';
+let spanTransport: BrowserSpanTransport | undefined;
+let retainedTransportStatus: BrowserSpanTransportStatus | undefined;
 
 function eventTitle(event: BrowserMonitorEvent): string {
   if (event.type === 'network_error') return `${event.method} ${event.path} · ${event.status || event.reason}`;
@@ -102,9 +116,55 @@ function setRunning(next: boolean): void {
   stopButton.disabled = !next;
   captureErrors.disabled = next;
   captureVitals.disabled = next;
+  serverRelay.disabled = next;
   allScenarioButtons.forEach((button) => { button.disabled = !next; });
   statePill.dataset.state = next ? 'running' : 'stopped';
   stateText.textContent = next ? '采集中' : '未启动';
+  renderTransportStatus();
+}
+
+function renderTransportStatus(): void {
+  const status = spanTransport?.getStatus() ?? retainedTransportStatus;
+  flushButton.disabled = !running || !spanTransport || !status || status.queueSize === 0 || status.state === 'sending';
+
+  if (!serverRelay.checked && !status) {
+    transportState.textContent = '默认关闭';
+    transportState.dataset.state = 'idle';
+    transportDetail.textContent = '仅本地 onEvent；不会发起平台请求。';
+    return;
+  }
+
+  if (!spanTransport && status?.state === 'disposed') {
+    transportState.textContent = '已停止';
+    transportState.dataset.state = 'disposed';
+    transportDetail.textContent = `累计 API 内存排队 ${status.apiQueuedCount} · 失败 ${status.failedCount} · 丢弃 ${status.droppedCount}`;
+    return;
+  }
+
+  if (!running || !spanTransport) {
+    transportState.textContent = serverRelay.checked ? '启动后生效' : '默认关闭';
+    transportState.dataset.state = 'idle';
+    transportDetail.textContent = `固定 ${BROWSER_SPAN_ENVIRONMENT} / ${BROWSER_SPAN_SERVICE} · 同源 ${BROWSER_SPAN_ENDPOINT}`;
+    return;
+  }
+
+  if (status?.state === 'sending') {
+    transportState.textContent = '发送中';
+    transportState.dataset.state = 'sending';
+  } else if (status?.queueSize) {
+    transportState.textContent = 'queued_in_memory';
+    transportState.dataset.state = 'queued_in_memory';
+  } else if (status?.lastDelivery === 'queued_in_memory') {
+    transportState.textContent = 'API内存排队';
+    transportState.dataset.state = 'queued_in_memory';
+  } else if (status?.state === 'failed') {
+    transportState.textContent = '上报失败';
+    transportState.dataset.state = 'failed';
+  } else {
+    transportState.textContent = '已启用 · 等待事件';
+    transportState.dataset.state = 'idle';
+  }
+  transportDetail.textContent = `浏览器队列 ${status?.queueSize ?? 0} · API内存排队 ${status?.apiQueuedCount ?? 0} · 失败 ${status?.failedCount ?? 0} · 丢弃 ${status?.droppedCount ?? 0}`;
 }
 
 function startSdk(): void {
@@ -121,9 +181,22 @@ function startSdk(): void {
   traceIdElement.textContent = currentTraceId;
   traceValidity.textContent = isValidTraceId(currentTraceId) ? '格式有效' : '格式无效';
   traceValidity.dataset.state = isValidTraceId(currentTraceId) ? 'ok' : 'bad';
+
+  // Create the opt-in relay before the monitor patch; the adapter also resolves the underlying fetch if loaded late.
+  spanTransport = serverRelay.checked
+    ? createBrowserSpanTransport({
+      endpoint: BROWSER_SPAN_ENDPOINT,
+      onStatusChange(status) {
+        retainedTransportStatus = status;
+        renderTransportStatus();
+      },
+    })
+    : undefined;
+  retainedTransportStatus = spanTransport?.getStatus();
+
   initBrowserMonitoring({
-    service: 'web-sdk-demo',
-    environment: 'dev',
+    service: BROWSER_SPAN_SERVICE,
+    environment: BROWSER_SPAN_ENVIRONMENT,
     captureErrors: captureErrors.checked,
     captureWebVitals: captureVitals.checked,
     sampleRate: 1,
@@ -132,12 +205,16 @@ function startSdk(): void {
       if (events.length > MAX_VISIBLE_EVENTS) events.length = MAX_VISIBLE_EVENTS;
       renderEvents();
     },
+    ...(spanTransport ? { transport: spanTransport.transport } : {}),
   });
   setRunning(true);
 }
 
 function stopSdk(): void {
   teardownBrowserMonitoring();
+  spanTransport?.dispose();
+  if (spanTransport) retainedTransportStatus = spanTransport.getStatus();
+  spanTransport = undefined;
   setRunning(false);
 }
 
@@ -172,6 +249,8 @@ stopButton.addEventListener('click', stopSdk);
 document.querySelector<HTMLButtonElement>('#trigger-fetch')!.addEventListener('click', () => void triggerFetchError());
 document.querySelector<HTMLButtonElement>('#trigger-js-error')!.addEventListener('click', triggerJavaScriptError);
 document.querySelector<HTMLButtonElement>('#trigger-rejection')!.addEventListener('click', triggerPromiseRejection);
+flushButton.addEventListener('click', () => { void spanTransport?.flush(); });
+serverRelay.addEventListener('change', renderTransportStatus);
 document.querySelector<HTMLButtonElement>('#clear-events')!.addEventListener('click', () => {
   events.length = 0;
   renderEvents();

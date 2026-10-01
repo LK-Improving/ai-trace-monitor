@@ -6,6 +6,8 @@
     "dev": "pnpm --filter @trace-ops/contracts build && dotenv -e .env -- concurrently -k -n web,api,collector -c blue,green,yellow \"pnpm --filter @trace-ops/web dev\" \"pnpm --filter @trace-ops/api dev\" \"pnpm --filter @trace-ops/collector dev\"",
     "build": "pnpm --filter @trace-ops/contracts build && pnpm --filter @trace-ops/api build && pnpm --filter @trace-ops/collector build && pnpm --filter @trace-ops/web build",
     "typecheck": "pnpm --filter @trace-ops/contracts build && pnpm --filter @trace-ops/contracts typecheck && pnpm --filter @trace-ops/api typecheck && pnpm --filter @trace-ops/collector typecheck && pnpm --filter @trace-ops/web typecheck",
+    "test:w8:relay": "node --test scripts/tests/browser-span-relay.test.cjs",
+    "acceptance:w8": "node scripts/w8-acceptance-session.cjs",
     "infra:up": "docker compose up -d --wait",
     "infra:down": "docker compose down"
   },
