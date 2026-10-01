@@ -7,6 +7,7 @@ import { ObservabilityModule } from './observability/observability.module';
 import { ProjectsModule } from './projects/projects.module';
 import { SpansModule } from './spans/spans.module';
 import { TraceIdMiddleware } from './trace/trace-id.middleware';
+import { TracesModule } from './traces/traces.module';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { TraceIdMiddleware } from './trace/trace-id.middleware';
     OverviewModule,
     SpansModule,
     ObservabilityModule,
+    TracesModule,
   ],
   controllers: [HealthController],
 })

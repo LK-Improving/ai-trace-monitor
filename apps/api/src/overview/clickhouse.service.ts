@@ -16,6 +16,7 @@ export class ClickHouseService implements OnModuleDestroy {
       password: config.get<string>('CLICKHOUSE_PASSWORD') ?? 'trace_ops_dev_only',
       // ClickHouse errors may contain query or payload details; do not log them.
       log: { level: ClickHouseLogLevel.OFF },
+      request_timeout: 10000,
     });
   }
 
@@ -28,6 +29,16 @@ export class ClickHouseService implements OnModuleDestroy {
         query,
         query_params: queryParams,
         format: 'JSONEachRow',
+        clickhouse_settings: {
+          max_execution_time: 5,
+          max_rows_to_read: '1000000',
+          max_bytes_to_read: '67108864',
+          max_result_rows: '2001',
+          max_result_bytes: '8388608',
+          max_memory_usage: '134217728',
+          read_overflow_mode: 'throw',
+          result_overflow_mode: 'throw',
+        },
       });
       return await result.json<Row>();
     } catch {

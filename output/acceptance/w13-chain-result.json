@@ -1,0 +1,21 @@
+{
+  "status": "passed",
+  "cleanup": "passed",
+  "checks": [
+    "real six-request 30-span pipeline",
+    "list/detail HTTP",
+    "deduplication and token counts",
+    "child failure sets trace error",
+    "stable pagination",
+    "whole trace service filter",
+    "project/environment isolation",
+    "orphan/cycle tree",
+    "safe attribute projection",
+    "admin authorization",
+    "content denied",
+    "invalid bounds and missing resource",
+    "existing overview with shared query budgets"
+  ],
+  "pipelineSpans": 30,
+  "cleanupFailures": []
+}

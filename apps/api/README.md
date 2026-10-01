@@ -96,6 +96,22 @@ Prompt、回答、向量、文档正文/URL、原始异常和密钥不写入监�
 
 协议参考：[OpenAI Chat](https://developers.openai.com/api/reference/resources/chat)、[Qdrant Query Points](https://api.qdrant.tech/api-reference/search/query-points)。运行构建后，可用 `$env:TRACE_OPS_RUN_INTEGRATION = '1'` 和 `node scripts/w11-chain-acceptance.cjs` 验证本地协议服务 → API → Kafka → Collector → ClickHouse。该验收不调用付费模型，也不证明真实 Qdrant 引擎召回质量；结果和清理记录在 `output/acceptance/w11-chain-result.json`。
 
+## W13–W16：Trace 查询
+
+`GET /api/v1/traces` 和 `GET /api/v1/traces/:traceId` 使用现有 `AdminTokenGuard`。仅可信服务端持有平台管理员令牌；项目写入密钥不能读取。需求中的项目成员 `trace:read` RBAC 尚未实现。当前前端仍是演示 Trace 页面，本轮不增加浏览器持有令牌或开放任意读代理。
+
+列表参数：`projectId` 必填 UUID；`environment=all|dev|staging|prod` 默认 all；`from`、`to` 必填 UTC ISO Z 字符串（秒或三位毫秒），半开窗口最多 30 天；可选 `traceId`、`service`、`status=ok|error`；`page` 默认 1，`pageSize` 默认 20、最大 100，offset 最大 10000。未知字段、数组参数、非法时间与分页均 400。
+
+详情参数：`projectId` 和具体 `environment=dev|staging|prod` 必填；可选成对 `from/to`，默认最近 30 天；`includeContent=false` 可省略，true 一律 403。额外的项目/环境上下文用于隔离同名 Trace，不能仅凭路径 ID 读取全库。
+
+列表以环境/Trace 为单位聚合，按 Span ID 去重后统计；服务筛选匹配整链中的服务，任一 Span 出错时 Trace 为 error。耗时取最早开始到最晚结束，不累加并行耗时；Token 只统计模型调用，根 Span 的复制 usage 不计。详情返回安全 Span 字段、摘要、错误分类和扁平执行树；孤儿、环和多个根显式标记。原始 error 与任意属性不返回，属性只保留严格类型约束的监控元数据。缺资源 404、依赖/查询预算/坏存储结果 503，错误响应不附带 SQL 或原文。
+
+详情最多返回 2000 Span，超出以 truncated 标记；摘要只基于返回集合。Span 明细保留原始 parentSpanId，tree.nodes 的连接单独修复孤儿/环。列表单项最多 120 个服务标识，超过时安全 503。跨时间窗、丢失或异步未入库的 Span 会造成不完整链路。列表 COUNT 和分页读取无事务快照，持续写入时 offset 分页可能漂移。查询侧去重不改变旧 Overview 或 ClickHouse 原始存储。
+
+共享 ClickHouse 查询有 10 秒客户端超时、5 秒执行预算、100 万行/64 MiB 读取预算、2001 行/8 MiB 结果预算和 128 MiB 内存预算，超限抛错，不返回假完整数据；Overview 同样受此保护。性能目标需后续 W15–W18 在代表性数据集测量，不能从小型功能验收推断 P95 达标。
+
+本地验收：构建后设置 `$env:TRACE_OPS_RUN_INTEGRATION = '1'`，执行 `node scripts/w13-chain-acceptance.cjs`。脚本使用隔离项目和 Topic，真实 HTTP、Kafka、已构建 Collector、ClickHouse，再验证列表和详情接口，最终清理本次资源。结果在 `output/acceptance/w13-chain-result.json`。
+
 ## 单元测试
 
 运行 `pnpm --filter @trace-ops/api test`。测试使用 Node 内置 `node:test`，管理逻辑通过 mock 数据库覆盖，不连接或修改 PostgreSQL。

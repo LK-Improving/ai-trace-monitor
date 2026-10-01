@@ -9,5 +9,6 @@ import { OverviewService } from './overview.service';
   imports: [DatabaseModule],
   controllers: [OverviewController],
   providers: [AdminTokenGuard, ClickHouseService, OverviewService],
+  exports: [ClickHouseService],
 })
 export class OverviewModule {}

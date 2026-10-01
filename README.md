@@ -77,6 +77,12 @@ Compose 中的凭证仅供绑定到 localhost 的个人开发环境使用；不�
 
 `pnpm build` 后设置 `$env:TRACE_OPS_RUN_INTEGRATION = '1'`，运行 `node scripts/w11-chain-acceptance.cjs`。本地协议服务模拟模型/Qdrant 响应，真实 Kafka、Collector 和 ClickHouse 检查 50 个 Span、并发父子关系和 Overview 统计，结束后清理本次资源。不调用付费模型，不声称真实 Qdrant 引擎召回质量已验收。证据在 `output/acceptance/w11-chain-result.json`。
 
+## Phase 2 W13–W16
+
+新增管理员保护的 Trace 列表及详情 API，支持项目/环境/时间/服务/状态过滤、分页、读取侧去重和安全执行树数据；详情必须携带 projectId 与具体环境。内容读取暂不开放，前端 Trace 页仍使用演示数据。接入和查询预算见 `apps/api/README.md`。
+
+本地构建后设置 `$env:TRACE_OPS_RUN_INTEGRATION = '1'`，执行 `node scripts/w13-chain-acceptance.cjs`。脚本验证真实管道与读接口、重复投递、父子树、项目/环境隔离和安全属性投影，清理本次隔离资源；结果在 `output/acceptance/w13-chain-result.json`。
+
 ## W8 本地真实链路验收
 
 先配置本地 `.env`、启动 Compose 并运行 `pnpm build`。以下操作会创建隔离测试项目、项目密钥和 Kafka Topic/消费组，结束时只清理本次资源。
