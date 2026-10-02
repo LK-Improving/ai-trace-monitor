@@ -83,6 +83,12 @@ Compose 中的凭证仅供绑定到 localhost 的个人开发环境使用；不�
 
 本地构建后设置 `$env:TRACE_OPS_RUN_INTEGRATION = '1'`，执行 `node scripts/w13-chain-acceptance.cjs`。脚本验证真实管道与读接口、重复投递、父子树、项目/环境隔离和安全属性投影，清理本次隔离资源；结果在 `output/acceptance/w13-chain-result.json`。
 
+## Phase 2 W15–W18
+
+新增管理员保护的 `/api/v1/metrics/overview`、`/api/v1/metrics/ai`：去重后的请求/失败量、P50/P95/P99、Token、按模型的延迟/TTFT，以及 RAG 成功/空召回和召回/重排耗时。支持项目、环境、服务、常用范围及明确 UTC 窗口；敏感内容仍默认屏蔽。前端真实 Trace/AI 页面切换在 W18–W20，本轮不修改 mock 页面；旧 `/overview` 暂留兼容。
+
+本地构建后设置 `$env:TRACE_OPS_RUN_INTEGRATION = '1'`，运行 `node scripts/w15-metrics-acceptance.cjs`。真实管道验证聚合语义，隔离的 10,000 请求 / 51,000 存储行基线测量 1h/24h/7d HTTP 查询 P95，清理本次资源；证据在 `output/acceptance/w15-metrics-result.json`。指标口径和有限读取边界见 `apps/api/README.md`。
+
 ## W8 本地真实链路验收
 
 先配置本地 `.env`、启动 Compose 并运行 `pnpm build`。以下操作会创建隔离测试项目、项目密钥和 Kafka Topic/消费组，结束时只清理本次资源。

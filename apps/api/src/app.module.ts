@@ -8,6 +8,7 @@ import { ProjectsModule } from './projects/projects.module';
 import { SpansModule } from './spans/spans.module';
 import { TraceIdMiddleware } from './trace/trace-id.middleware';
 import { TracesModule } from './traces/traces.module';
+import { MetricsModule } from './metrics/metrics.module';
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { TracesModule } from './traces/traces.module';
     SpansModule,
     ObservabilityModule,
     TracesModule,
+    MetricsModule,
   ],
   controllers: [HealthController],
 })

@@ -112,6 +112,20 @@ Prompt、回答、向量、文档正文/URL、原始异常和密钥不写入监�
 
 本地验收：构建后设置 `$env:TRACE_OPS_RUN_INTEGRATION = '1'`，执行 `node scripts/w13-chain-acceptance.cjs`。脚本使用隔离项目和 Topic，真实 HTTP、Kafka、已构建 Collector、ClickHouse，再验证列表和详情接口，最终清理本次资源。结果在 `output/acceptance/w13-chain-result.json`。
 
+## W15–W18：聚合指标
+
+新增 `GET /api/v1/metrics/overview` 与 `GET /api/v1/metrics/ai`，均要求可信服务端的管理员令牌。`projectId` 必填；环境默认 all；可选 `service`。时间使用 `range=1h|24h|7d`（默认 24h），或成对 `from/to` UTC ISO Z 半开窗口（最多 30 天），不能同时使用两种模式。`groupBy` 当前仅支持 service；模型分组由 topModels 和 AI 接口提供。未知/数组参数、非法窗口返回 400，缺项目 404，依赖故障、坏存储结果或查询预算超限返回固定 503。
+
+总览按项目/环境/Trace/Span 去重后聚合：每条存在请求根节点的 Trace 计一次请求，任一子节点失败计为失败请求；单独的浏览器诊断和无根链路不计请求。延迟取整链最早开始至最晚结束，P50/P95/P99 使用精确分位数。Token 只合计 `llm.generate`，即使根节点复制 usage/model 也不重复计费。无根链路中的模型调用仍计 Token。服务筛选匹配整条链路；服务健康表本身是去重后 Span 级计数，不能与请求总数相加。
+
+总览响应包含需求 6.4 的 `summary`、`timeseries`、`services`、`topModels`；同时保留同值 `metrics` / `series` 作为现有总览形状的兼容字段。包含零填充趋势及安全最近错误摘要。AI 接口返回 `llm`、`rag`，LLM 统计调用量、输入/输出/总 Token、总延迟与首 Token 延迟及模型分组；RAG 只统计 `rag.retrieve`，不重复计算 recall/rerank 子节点。AI 的服务筛选是调用 Span 级筛选。
+
+成功率为成功 RAG 调用数/全部 RAG 调用数；空召回率为成功且数量可观测的空召回数/可观测成功调用数，无可观测数量时为空值 null。TTFT、召回、重排耗时只接受有效 JSON 中有限的非负数值，缺失/非法数据不当作零样本。样本数显式返回；零样本时耗时指标为零，不代表真实耗时为零。其他比例取值为 0–1。模型名只允许有限长度的标识字符，其他值合并为 `(unknown)`；模型分组最多 100 个，超出返回安全 503，不伪装完整结果。不会返回 Prompt、回答、文档原文/URL、原始 error 或任意 attributes。
+
+旧 `/overview` 为首屏兼容暂时保留旧统计口径；W18–W20 页面切换时再迁移。新接口使用有预算的读取侧去重和聚合，没有新增物化视图或持久化长周期指标。直接对至少一次投递的原始块做累加物化视图会重复计数，因此持久化预聚合必须先设计跨批幂等与迟到更新策略，不能从本轮查询推断 30 天 TTL 后仍有历史指标。所有统计只基于所选窗口内已入库的数据，跨窗或缺失 Span 可能造成不完整。
+
+本地验收：`pnpm build` 后设置 `$env:TRACE_OPS_RUN_INTEGRATION = '1'`，运行 `node scripts/w15-metrics-acceptance.cjs`。复用隔离真实管道，另生成 10,000 条请求、50,000 个唯一 Span 和 1,000 行重投递数据；对 1h/24h/7d 的列表、指标总览和 AI 查询测量 HTTP P95。结果写入 `output/acceptance/w15-metrics-result.json`，测试结束清理自有项目、行、Topic/消费组及进程。该本地合成基线不是生产并发或容量承诺。
+
 ## 单元测试
 
 运行 `pnpm --filter @trace-ops/api test`。测试使用 Node 内置 `node:test`，管理逻辑通过 mock 数据库覆盖，不连接或修改 PostgreSQL。

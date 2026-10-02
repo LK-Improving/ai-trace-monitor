@@ -1,0 +1,145 @@
+{
+  "status": "passed",
+  "cleanup": "passed",
+  "checks": [
+    "real six-request 30-span pipeline",
+    "list/detail HTTP",
+    "deduplication and token counts",
+    "child failure sets trace error",
+    "stable pagination",
+    "whole trace service filter",
+    "project/environment isolation",
+    "orphan/cycle tree",
+    "safe attribute projection",
+    "admin authorization",
+    "content denied",
+    "invalid bounds and missing resource",
+    "existing overview with shared query budgets"
+  ],
+  "stage": "completed",
+  "pipelineMetrics": {
+    "requests": 7,
+    "errors": 3,
+    "totalTokens": 60,
+    "llmCalls": 6,
+    "ttftSamples": 2,
+    "ragCalls": 6,
+    "recallSamples": 6,
+    "rerankSamples": 6
+  },
+  "metricChecks": [
+    "deduplicated trace counts",
+    "child failure included",
+    "LLM-only token sums",
+    "TTFT/recall/rerank sample counts",
+    "rootless request exclusion",
+    "whole-trace overview service filter",
+    "span-scoped AI service filter",
+    "project/environment isolation",
+    "bounded explicit windows",
+    "safe protected HTTP endpoints",
+    "missing/invalid/oversized JSON attributes ignored",
+    "invalid model redaction",
+    "successful observed recall denominator",
+    "UInt64 sums widen before safe integer checks; oversized totals fail safely"
+  ],
+  "benchmark": {
+    "traces": 10000,
+    "uniqueSpans": 50000,
+    "storedSpans": 51000,
+    "ranges": [
+      "1h",
+      "24h",
+      "7d"
+    ],
+    "method": "HTTP wall time; nearest-rank P95; 20 samples after warm-up; sequential; no application cache",
+    "runtime": "v20.0.0",
+    "platform": "win32",
+    "environment": "local Docker Compose; synthetic dataset; not production capacity certification",
+    "timings": [
+      {
+        "range": "1h",
+        "endpoint": "overview",
+        "samples": 20,
+        "concurrency": 1,
+        "p50Ms": 270,
+        "p95Ms": 365,
+        "maxMs": 397
+      },
+      {
+        "range": "1h",
+        "endpoint": "ai",
+        "samples": 20,
+        "concurrency": 1,
+        "p50Ms": 133,
+        "p95Ms": 177,
+        "maxMs": 177
+      },
+      {
+        "range": "1h",
+        "endpoint": "list",
+        "samples": 20,
+        "concurrency": 1,
+        "p50Ms": 150,
+        "p95Ms": 183,
+        "maxMs": 248
+      },
+      {
+        "range": "24h",
+        "endpoint": "overview",
+        "samples": 20,
+        "concurrency": 1,
+        "p50Ms": 474,
+        "p95Ms": 726,
+        "maxMs": 748
+      },
+      {
+        "range": "24h",
+        "endpoint": "ai",
+        "samples": 20,
+        "concurrency": 1,
+        "p50Ms": 248,
+        "p95Ms": 338,
+        "maxMs": 385
+      },
+      {
+        "range": "24h",
+        "endpoint": "list",
+        "samples": 20,
+        "concurrency": 1,
+        "p50Ms": 216,
+        "p95Ms": 274,
+        "maxMs": 333
+      },
+      {
+        "range": "7d",
+        "endpoint": "overview",
+        "samples": 20,
+        "concurrency": 1,
+        "p50Ms": 428,
+        "p95Ms": 548,
+        "maxMs": 596
+      },
+      {
+        "range": "7d",
+        "endpoint": "ai",
+        "samples": 20,
+        "concurrency": 1,
+        "p50Ms": 190,
+        "p95Ms": 216,
+        "maxMs": 222
+      },
+      {
+        "range": "7d",
+        "endpoint": "list",
+        "samples": 20,
+        "concurrency": 1,
+        "p50Ms": 193,
+        "p95Ms": 218,
+        "maxMs": 226
+      }
+    ]
+  },
+  "pipelineSpans": 30,
+  "cleanupFailures": []
+}
