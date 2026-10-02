@@ -124,6 +124,7 @@ async function main() {
   assert.equal(overview.metrics.requestCount, 8); assert.equal(overview.metrics.errorCount, 2);
   assert.equal(overview.metrics.totalTokens, 90);
   await metricsChecks(readPort, ids[0], completeId, bounds);
+  await optionalRerankChecks(env, readPort);
   await benchmark(readPort);
   await overflowCheck(readPort, bounds);
   const protectedValues = [process.env.PLATFORM_ADMIN_TOKEN, process.env.DATABASE_URL, process.env.CLICKHOUSE_PASSWORD,
@@ -132,6 +133,38 @@ async function main() {
   report.checks = ['real six-request 30-span pipeline', 'list/detail HTTP', 'deduplication and token counts', 'child failure sets trace error',
     'stable pagination', 'whole trace service filter', 'project/environment isolation', 'orphan/cycle tree', 'safe attribute projection',
     'admin authorization', 'content denied', 'invalid bounds and missing resource', 'existing overview with shared query budgets']; report.status = 'passed'; report.pipelineSpans = 30;
+}
+async function optionalRerankChecks(env, readPort) {
+  report.stage = 'optional rerank adapter pipeline';
+  const project = ids[1];
+  await pool.query('INSERT INTO services(project_id,name,environment) VALUES($1,$2,$3)', [project, 'w13-api', 'staging']);
+  const port = await start({ ...env, SERVER_TRACE_PROJECT_ID: project, SERVER_TRACE_ENVIRONMENT: 'staging' });
+  const missingId = `no-rerank-${randomUUID()}`;
+  await request(port, '/w11-fixture/chat/noRerank', 200, true, missingId);
+  let missingRows;
+  await until(async () => { missingRows = (await rows(project)).filter(row => row.trace_id === missingId); return missingRows.length === 4; });
+  assert(!missingRows.some(row => row.operation === 'rag.rerank'));
+  const rag = missingRows.find(row => row.operation === 'rag.retrieve');
+  assert(!Object.hasOwn(JSON.parse(rag.attributes), 'rag.rerank_ms'));
+  const route = `/metrics/ai?projectId=${project}&environment=staging&range=1h`;
+  const noRerank = await request(readPort, route);
+  assert.equal(noRerank.rag.callCount, 1);
+  assert.equal(noRerank.rag.recallSampleCount, 1);
+  assert.equal(noRerank.rag.rerankSampleCount, 0);
+  assert.equal(noRerank.rag.p95RerankMs, 0); // Wire convention; UI must use sample count, not this zero.
+  const observedId = `observed-rerank-${randomUUID()}`;
+  await request(port, '/w11-fixture/chat/complete', 200, true, observedId);
+  let observedRows;
+  await until(async () => { observedRows = (await rows(project)).filter(row => row.trace_id === observedId); return observedRows.length === 5; });
+  assert(observedRows.some(row => row.operation === 'rag.rerank'));
+  const observedMs = JSON.parse(observedRows.find(row => row.operation === 'rag.retrieve').attributes)['rag.rerank_ms'];
+  const mixed = await request(readPort, route);
+  assert.equal(mixed.rag.callCount, 2);
+  assert.equal(mixed.rag.rerankSampleCount, 1);
+  assert.equal(mixed.rag.p95RerankMs, observedMs);
+  report.optionalRerank = { noCallbackSpans: 4, withCallbackSpans: 5, missingSampleCount: 0, mixedSampleCount: 1,
+    checks: ['no callback produces no rerank span or measurement', 'real Kafka/Collector storage retains absence',
+      'unobserved aggregation has zero samples', 'mixed aggregation includes only performed rerank'] };
 }
 async function metricsChecks(port, project, completeId, bounds) {
   report.stage = 'real pipeline metrics';

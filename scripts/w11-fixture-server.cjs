@@ -79,11 +79,13 @@ async function provider(request, response) {
 class FixtureController {
   constructor(clients) { this.clients = clients; }
   async chat(mode) {
-    const models = { complete: 'fixture-complete', stream: 'fixture-stream', noUsage: 'fixture-no-usage', rateLimit: 'fixture-rate-limit', timeout: 'fixture-timeout', cancel: 'fixture-stream' };
+    const models = { complete: 'fixture-complete', noRerank: 'fixture-complete', stream: 'fixture-stream', noUsage: 'fixture-no-usage', rateLimit: 'fixture-rate-limit', timeout: 'fixture-timeout', cancel: 'fixture-stream' };
     const model = models[mode];
     if (!model) throw new Error('Unknown fixture mode');
     const documents = await this.clients.rag().retrieve({ vector: [1, 0], topK: 3,
-      rerank: async docs => { await delay(15); return [...docs].reverse().map((doc, index) => ({ ...doc, score: 0.95 - index * 0.1 })); },
+      ...(mode === 'noRerank' ? {} : {
+        rerank: async docs => { await delay(15); return [...docs].reverse().map((doc, index) => ({ ...doc, score: 0.95 - index * 0.1 })); },
+      }),
     });
     const input = { model, messages: [{ role: 'user', content: `question-${canary}: ${documents[0].payload.content}` }] };
     if (mode === 'stream' || mode === 'cancel') {

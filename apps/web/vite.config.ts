@@ -2,7 +2,7 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { isAdminReadRequest } from './src/admin-proxy';
+import { createAdminProxy } from './src/admin-proxy-runtime.mjs';
 
 const require = createRequire(import.meta.url);
 const { createBrowserSpanRelay } = require('../../scripts/browser-span-relay.cjs');
@@ -14,6 +14,19 @@ function browserSpanRelay() {
       server.middlewares.use(createBrowserSpanRelay({
         projectKey: process.env.SDK_TEST_PROJECT_KEY,
         apiPort: process.env.API_PORT ?? '3001',
+      }));
+    },
+  };
+}
+
+function localAdminQueryProxy() {
+  return {
+    name: 'local-admin-query-proxy',
+    configureServer(server: import('vite').ViteDevServer) {
+      server.middlewares.use(createAdminProxy({
+        // Read the secret only at request time in the dev-server process.
+        adminToken: () => process.env.PLATFORM_ADMIN_TOKEN,
+        apiPort: () => process.env.API_PORT ?? '3001',
       }));
     },
   };
@@ -48,24 +61,23 @@ function localSdkTestEndpoint() {
   };
 }
 
+function localWebPort() {
+  const configuredPort = process.env.WEB_DEV_PORT;
+  if (configuredPort === undefined) return 5173;
+  if (!/^\d{1,5}$/.test(configuredPort)) return 5173;
+  const port = Number(configuredPort);
+  return port >= 0 && port <= 65535 ? port : 5173;
+}
+
 export default defineConfig({
-  plugins: [react(), localSdkTestEndpoint(), browserSpanRelay()],
+  plugins: [react(), localAdminQueryProxy(), localSdkTestEndpoint(), browserSpanRelay()],
   server: {
     host: '127.0.0.1',
-    port: 5173,
+    port: localWebPort(),
     proxy: {
       '/api': {
         target: `http://127.0.0.1:${process.env.API_PORT ?? '3001'}`,
         changeOrigin: true,
-        configure(proxy) {
-          proxy.on('proxyReq', (proxyRequest, request) => {
-            if (!isAdminReadRequest(request.method, request.url)) return;
-            if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(request.socket.remoteAddress ?? '')) return;
-
-            const adminToken = process.env.PLATFORM_ADMIN_TOKEN?.trim();
-            if (adminToken) proxyRequest.setHeader('Authorization', `Bearer ${adminToken}`);
-          });
-        },
       },
     },
   },

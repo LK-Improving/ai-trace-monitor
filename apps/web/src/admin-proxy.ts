@@ -1,17 +1,23 @@
-const ADMIN_READ_PATHS = new Set(['/api/v1/projects', '/api/v1/overview']);
+const ADMIN_READ_PATHS = new Set([
+  '/api/v1/projects',
+  '/api/v1/overview',
+  '/api/v1/metrics/overview',
+  '/api/v1/metrics/ai',
+  '/api/v1/traces',
+]);
 
-/** Restrict server-side admin credentials to the two read-only endpoints used by Overview. */
+/**
+ * Legacy path-only allowlist check retained for existing consumers/tests.
+ * Runtime credential forwarding uses the stricter local proxy and query
+ * validator in admin-proxy-runtime.mjs.
+ */
 export function isAdminReadRequest(method: string | undefined, requestUrl: string | undefined): boolean {
   if (method?.toUpperCase() !== 'GET' || !requestUrl) return false;
-  // Vite should only ever proxy origin-form paths. Reject absolute-form and
-  // protocol-relative URLs before URL parsing so credentials cannot be
-  // attached to a request whose authority was supplied by the caller.
-  if (!requestUrl.startsWith('/') || requestUrl.startsWith('//')) return false;
-
-  try {
-    const pathname = new URL(requestUrl, 'http://vite.local').pathname.replace(/\/+$/, '') || '/';
-    return ADMIN_READ_PATHS.has(pathname);
-  } catch {
+  if (!requestUrl.startsWith('/') || requestUrl.startsWith('//') || requestUrl.includes('\\') || requestUrl.includes('#')) {
     return false;
   }
+
+  const pathname = requestUrl.split('?', 1)[0].replace(/\/+$/, '') || '/';
+  if (ADMIN_READ_PATHS.has(pathname)) return true;
+  return /^\/api\/v1\/traces\/[^/]+$/.test(pathname);
 }

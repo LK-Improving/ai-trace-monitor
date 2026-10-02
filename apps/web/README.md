@@ -1,3 +1,95 @@
+# Phase 2：Trace ID 与服务端 Span Quickstart
+
+Docs 页的 Node.js 示例集中导出为 `NODE_QUICKSTART`，浏览器示例为 `BROWSER_QUICKSTART`，来源是 `src/quickstart.ts`。Node.js 18+ 可直接用原生 `fetch`，不需要安装或导入 SDK。将 Node 示例保存为 `quickstart.mjs` 后执行 `node quickstart.mjs`。
+
+运行前配置 `TRACE_OPS_PROJECT_KEY`、`TRACE_OPS_SERVICE` 和 `TRACE_OPS_ENVIRONMENT`，并确认 service/environment 已在隔离项目中注册。模板默认使用 `customer-api` / `dev`；`TRACE_OPS_ENDPOINT` 可选，默认 `http://localhost:3001/api/v1/spans`。环境只接受 `dev`、`staging`、`prod`。项目创建、服务注册和密钥签发方法见 [`apps/api/README.md` 的管理 API](../api/README.md#管理-api)；这些管理路由需要可信服务端的管理员令牌。
+
+此请求把 `projectKey` 放在 JSON body，不放在 header；批次 `environment` 与每个 Span 的 `service` 需要匹配已注册绑定。Span 使用 `traceId`、`spanId`、可选 `parentSpanId`、`service`、`operation`、`startTime`、`endTime`、`status` 和 `attributes`。服务端补充 `projectId` 与 `schemaVersion`。HTTP 202 表示 API 有界内存队列已接受，不表示已持久写入 Kafka 或 ClickHouse。
+
+```js
+import { randomUUID } from 'node:crypto';
+
+const endpoint = process.env.TRACE_OPS_ENDPOINT ?? 'http://localhost:3001/api/v1/spans';
+const projectKey = process.env.TRACE_OPS_PROJECT_KEY;
+const environment = process.env.TRACE_OPS_ENVIRONMENT ?? 'dev';
+const service = process.env.TRACE_OPS_SERVICE ?? 'customer-api';
+
+if (!projectKey) throw new Error('Set TRACE_OPS_PROJECT_KEY in the server environment.');
+if (!['dev', 'staging', 'prod'].includes(environment)) {
+  throw new Error('TRACE_OPS_ENVIRONMENT must be dev, staging, or prod.');
+}
+
+const traceId = 'trace_v1_' + randomUUID();
+const rootSpanId = randomUUID();
+const childSpanId = randomUUID();
+const startTime = Date.now();
+const childStartTime = Math.max(startTime, Date.now());
+const childEndTime = Math.max(childStartTime, Date.now());
+const endTime = Math.max(childEndTime, startTime);
+
+const payload = {
+  projectKey,
+  environment,
+  spans: [
+    {
+      traceId,
+      spanId: rootSpanId,
+      service,
+      operation: 'http.server',
+      startTime,
+      endTime,
+      status: 'ok',
+      attributes: { source: 'quickstart' },
+    },
+    {
+      traceId,
+      spanId: childSpanId,
+      parentSpanId: rootSpanId,
+      service,
+      operation: 'quickstart.work',
+      startTime: childStartTime,
+      endTime: childEndTime,
+      status: 'ok',
+      attributes: { source: 'quickstart' },
+    },
+  ],
+};
+
+const response = await fetch(endpoint, {
+  method: 'POST',
+  signal: AbortSignal.timeout(5000),
+  headers: {
+    'content-type': 'application/json',
+    'x-trace-id': traceId,
+  },
+  body: JSON.stringify(payload),
+});
+
+if (response.status !== 202) {
+  throw new Error('Span ingest expected HTTP 202, received ' + response.status);
+}
+
+console.log('Trace ' + traceId + ' accepted; HTTP 202 means queued in API process memory only, not durable storage.');
+```
+
+浏览器 quickstart 只生成并向自己的应用 API 透传 `x-trace-id`。它不会创建或上报 Span/前端监控事件，浏览器代码也不得持有项目密钥；前端事件采集不属于本阶段。
+
+```js
+const traceId = 'trace_v1_' + crypto.randomUUID();
+
+await fetch('/api/chat', {
+  method: 'POST',
+  headers: {
+    'content-type': 'application/json',
+    'x-trace-id': traceId,
+  },
+  body: JSON.stringify({ question }),
+});
+
+// This only propagates a correlation ID to your application API.
+// It does not create or upload Span or frontend monitoring events.
+```
+
 # 浏览器监控 SDK（Phase 1 W2–W3）
 
 SDK 入口位于 `src/api.ts`。它复用 W1 的 Trace ID helper，并提供页面级监控启动、停止、Web Vitals 和前端异常事件。环境必须传入规范值 `dev`、`staging` 或 `prod`；展示层别名仅由 `toProtocolEnvironment()` 转换。
@@ -45,11 +137,11 @@ Relay 只接受无 query/hash 的同源 endpoint，验收页固定使用 `POST /
 
 该 relay 是一个可选的浏览器到宿主 BFF 接口示例，不是生产网关，也不替代应用自己的认证、生产反向代理或凭证管理。启动开发服务前在服务端进程设置 `SDK_TEST_PROJECT_KEY`。该密钥只供服务端 relay 使用，不能设置为 `VITE_*`，不会进入浏览器 Bundle 或 Span 请求体；服务端 relay 再使用此密钥转发到 API。未配置时 relay 会失败关闭；默认关闭状态不会发出上报请求。
 
-## Overview 控制台（Phase 1 W7）
+## 控制台真实数据链路（Phase 2 W18–W20）
 
-运行仓库根目录的 `pnpm dev` 时，暖白色总览页会通过 `/api/v1/projects` 和 `/api/v1/overview` 读取项目、指标、趋势、服务状态与最近错误。前端请求只走同源 `/api`；Vite 开发服务器仅为这两个只读 GET 路由从进程环境中的 `PLATFORM_ADMIN_TOKEN` 注入 Bearer 令牌。令牌不进入浏览器 Bundle、`VITE_*` 配置或存储。若未配置令牌或 API 不可用，页面显示明确错误，不回退为假实时数据。
+运行仓库根目录的 `pnpm dev` 时，总览、Trace 检索/详情和 AI 链路页读取真实 API 数据，包括 `/api/v1/projects`、`/api/v1/metrics/overview`、`/api/v1/metrics/ai`、`/api/v1/traces` 及单条 Trace 详情。前端只走同源 `/api`；Vite 开发服务器仅为严格白名单内的只读 GET 路由从进程环境中的 `PLATFORM_ADMIN_TOKEN` 注入 Bearer 令牌，并校验查询参数。令牌不进入浏览器 Bundle、`VITE_*` 配置或存储。未配置令牌或 API 不可用时显示明确错误，不回退为假实时数据。
 
-此 Vite 代理仅用于本地开发。部署生产控制台时，必须配置可信的服务端反向代理/BFF 或用户登录与权限体系；不要把平台管理员令牌发给浏览器。Overview 的“最新 Traces”、Trace 检索、AI 链路和告警中心仍是带有“演示数据”标识的原型数据，待相应 API 阶段接入。
+此 Vite 代理仅用于本地开发。生产控制台必须配置可信的服务端反向代理/BFF 或用户登录与权限体系，不能把管理员令牌发给浏览器。总览“最新 Traces”、Trace 检索/详情及 AI 指标已经接入真实数据；告警中心和项目设置仍为明确标注的演示页面，不执行真实配置写入。前端事件联合查询及生产权限闭环留在 Phase 3。
 
 开发代理跟随进程环境中的 `API_PORT`（默认 3001）。若该端口被其他项目占用，可在根目录 `.env` 中设置其他端口后重启 `pnpm dev`；API 与前端代理会使用相同端口。请用 `http://127.0.0.1:5173/` 访问，避免 `localhost` 解析到其他应用占用的 IPv6 监听地址。
 

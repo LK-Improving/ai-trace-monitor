@@ -353,7 +353,6 @@ export class QdrantRagClient {
           observation.set('rag.recalled_count', documents.length);
           observation.set('rag.empty', documents.length === 0);
           observation.set('sources', documents.slice(0, MAX_TOP_K).map(document => hashPointId(document.id)));
-          observation.set('rag.rerank_ms', 0);
           recallObservation.finish();
         } catch (error) {
           const safeError = safeAdapterError(error, 'network_error');

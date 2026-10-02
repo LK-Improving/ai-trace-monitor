@@ -1,6 +1,6 @@
 # API 服务
 
-NestJS API 监听 `API_PORT`（默认 `3001`），路由前缀为 `/api/v1`。当前包含公开健康检查、项目管理最小 API、基础 Overview 查询，以及每个请求的 `x-trace-id` 解析和响应回传。
+NestJS API 监听 `API_PORT`（默认 `3001`），路由前缀为 `/api/v1`。当前包含健康检查、项目/服务/密钥与 Span 接入 API、Trace 查询、去重总览及 AI 指标，并提供服务端/RAG/LLM 埋点。控制台总览、Trace 和 AI 页面已接真实接口；告警、设置写操作、生产 RBAC 与前端事件完整联查仍待 Phase 3。
 
 ## 本地配置
 
@@ -22,7 +22,7 @@ HTTP 202 的 `delivery: "queued_in_memory"` 仅表示数据进入有界内存队
 
 所有项目、服务、环境、密钥和 Overview 路由均要求管理员令牌。Overview 当前只读 ClickHouse 与项目/服务元数据；它不返回错误原文或 Span `attributes`。
 
-该令牌是平台级管理凭证，只能由可信服务端持有。Web 浏览器不得直接持有该令牌，也不能把令牌放进 `VITE_*` 配置。当前本地开发由 Vite 服务端代理为 Overview 所需的两个只读 GET 路由注入令牌；生产部署仍需可信反向代理/BFF 或正式的用户身份与权限方案。
+该令牌是平台级管理凭证，只能由可信服务端持有。Web 浏览器不得直接持有该令牌，也不能把令牌放进 `VITE_*` 配置。当前本地 Vite 服务端代理仅为项目列表、旧 Overview、新指标与 Trace 列表/详情白名单的合法 GET 注入令牌，不代理项目/服务/密钥写操作；生产部署仍需可信反向代理/BFF 或正式的用户身份与权限方案。
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
@@ -45,6 +45,8 @@ Overview 的全局请求量、错误数、P95 与趋势按根 Span（`parent_spa
 API 接收单个符合 W1 格式的 `x-trace-id` 时沿用该值；缺失、格式无效或重复/歧义时生成 `trace_v1_<UUID>`。请求 Body 不参与 Trace ID 解析。中间件会在路由执行前设置响应头，因此成功和异常响应都会带 `x-trace-id`；CORS 同时暴露该响应头。
 
 ## W9–W11 服务端链路记录
+
+下列周阶段小节保留开发时点说明；当前查询能力和页面状态以本文开头及 W18–W20 控制台文档为准。
 
 已加入框架独立的 `src/observability/trace-recorder.ts` 和 NestJS `ObservabilityModule`。平台 API 默认关闭服务端埋点，避免未绑定租户就写入监控数据。先在项目中注册服务和环境，再设置服务端配置并重启 API：
 
@@ -80,7 +82,7 @@ $env:TRACE_OPS_RUN_INTEGRATION = '1'
 node scripts/w9-chain-acceptance.cjs
 ```
 
-脚本仅连接本机依赖，创建并清理独立项目、Topic、消费组和本次进程；安全结果在 `output/acceptance/w9-chain-result.json`。Collector 使用已构建入口；当前环境 `tsx watch` 的源码加载问题不属于本轮已验证的热更新能力。
+脚本仅连接本机依赖，创建并清理独立项目、Topic、消费组和本次进程；安全结果在 `output/acceptance/w9-chain-result.json`。该脚本使用构建入口。2026-10-02 独立开发模式检查确认 Node v24.0.0 / tsx 4.23.15 下 Collector `tsx watch src/main.ts` 成功订阅；历史 Node20 加载失败仍保留，不等于整套 `pnpm dev` 验收已通过。
 
 ## W11–W14：模型与 RAG 调用适配
 
@@ -91,6 +93,8 @@ node scripts/w9-chain-acceptance.cjs
 LLM 产生 `llm.generate`，记录请求/返回模型、安全结束原因、总耗时、usage 可用标记及 Token。流式 TTFT 从首个非空内容 delta 计算，不把角色或响应头当首 Token；普通调用不伪造 TTFT。缺失 usage 保持未知，输入输出为非负安全整数，提供的总数必须等于两者之和。流中途关闭、超时和协议不完整为失败；已收到的 usage 是部分可用数据，不表示调用成功。消费方应使用 `for await` 或显式 `return()` 关闭迭代器，不能遗弃未关闭的迭代器。
 
 RAG 使用 Qdrant Query Points API；`rag.retrieve` 下包含 `rag.recall` 和可选 `rag.rerank`。记录 topK、召回数量、空召回、SHA-256 文档 ID 标识及召回/重排耗时。排名快照最多各 20 条，保留总数和截断标记，业务 topK 上限仍为 100。重排回调只允许已有文档重排、调整分数或取子集，不能引入新 ID；接收 AbortSignal，总超时不因回调忽略取消而无限等待。超时不能强制停止回调内部副作用，回调实现仍需协作取消。向量生成和重排模型不在该适配器内实现。
+
+未提供 `rerank` 回调时不产生重排 Span 或 `rag.rerank_ms`，聚合样本数为零；真实执行且耗时为零的重排仍是有效样本。页面需结合样本数区分“未观测”和“耗时为零”。
 
 Prompt、回答、向量、文档正文/URL、原始异常和密钥不写入监控；业务返回仍包含模型内容和 Qdrant payload。哈希是关联标识，不是加密或不可逆匿名化承诺。错误分类固定为限流、超时、认证、内容过滤、提供方、网络、协议、取消或输入无效。
 

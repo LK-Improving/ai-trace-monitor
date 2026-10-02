@@ -1,6 +1,6 @@
 # AI 全链路监控平台
 
-基于需求设计文档的 TypeScript 工作区。Phase 1 已实现项目/服务/密钥 API、浏览器 SDK 基础采集、Span 上报、Kafka → Collector → ClickHouse 与真实总览。Trace 检索与执行树、AI 链路、告警和配置页面仍为明确标记的 mock，不代表完整 MVP 已交付。现有 `prototype/` 交互原型保留不动。
+基于需求设计文档的 TypeScript 工作区。Phase 1–2 已实现项目/服务/密钥 API、浏览器采集基础、服务端/RAG/LLM Span、Kafka → Collector → ClickHouse，以及读取真实 API 的总览、Trace 检索/执行树和 AI 指标页。告警与项目设置仍是明确标注的演示；生产权限与完整前端事件联查留待 Phase 3，不代表完整 MVP 已交付。现有 `prototype/` 交互原型保留不动。
 
 项目开发阶段、相对周计划和里程碑见 [AI 全链路监控平台开发排期计划](.agents/Documents/项目计划/AI全链路监控平台-开发排期计划.md)。排期依据需求优先级与架构路线图编制，具体日历日期待项目启动和资源确认后锁定。
 
@@ -57,7 +57,7 @@ pnpm infra:down   # 停止并移除容器（保留数据卷）
 
 ## 当前边界
 
-总览从 API 读取项目、请求指标、服务状态和最近错误，不在 API 出错时回退成假实时数据。其他演示页面的筛选、告警确认/关闭、设置开关仅改变本地状态。项目密钥仅保存 Hash；Span API 认证后写入项目/环境/schema 元数据。Collector 写库成功后才提交 offset，无效消息仅保留固定安全分类；当前为至少一次投递，尚无跨重投的全局去重保证，也未实现持久化 DLQ。Prompt、Response、用户原文默认不采集。
+总览、Trace 列表/详情与 AI 指标页从 API 读取，不在 API 出错时回退成 mock。告警、项目设置仍是明确标注的演示页面，确认/关闭和设置开关仅改变本地状态。项目密钥仅保存 Hash；Span API 认证后写入项目/环境/schema 元数据。Collector 写库成功后才提交 offset，无效消息仅保留固定安全分类；当前为至少一次投递，尚无跨重投的全局去重保证，也未实现持久化 DLQ。Prompt、Response、用户原文默认不采集。
 
 浏览器 SDK 默认无网络 sink；`sdk-test.html` 的“上报到本地平台”也默认关闭。显式开启时，浏览器将脱敏事件转换为 Span，再由同源本地 relay 严格校验并转发。`SDK_TEST_PROJECT_KEY` 只配置在 Vite 服务端进程，不使用 `VITE_*` 或浏览器存储；relay 仅允许本机同源请求、固定服务 `web-sdk-demo` 与环境 `dev`，缺少密钥时关闭转发。该验收 relay 不是生产接入网关，生产应由接入应用自己的可信 BFF 完成认证、限流和服务绑定。
 
@@ -67,9 +67,11 @@ Compose 中的凭证仅供绑定到 localhost 的个人开发环境使用；不�
 
 ## Phase 2 W9–W11
 
+下列 W9–W18 小节为对应开发时点的记录；当前页面状态以本页开头和 W18–W20 小节为准。
+
 服务端记录器和 NestJS 根 Span 接入已实现，默认关闭。按项目已注册服务设置 `SERVER_TRACE_ENABLED`、`SERVER_TRACE_PROJECT_ID`、`SERVER_TRACE_SERVICE`、`SERVER_TRACE_ENVIRONMENT` 后重启 API；健康检查的 `tracing.state` 可确认启用状态。详细接入、关闭时的业务回退和采集边界见 `apps/api/README.md`。本轮不改变前端演示页面，也不把测试用的 RAG/LLM Span 当作真实模型适配。
 
-显式本地验收：`pnpm build` 后设置 `$env:TRACE_OPS_RUN_INTEGRATION = '1'`，运行 `node scripts/w9-chain-acceptance.cjs`。脚本创建隔离资源，检查真实 HTTP → Kafka → Collector → ClickHouse，并清理本次数据和进程。Collector 使用构建产物，不代表 `tsx watch` 热更新问题已解决。
+显式本地验收：`pnpm build` 后设置 `$env:TRACE_OPS_RUN_INTEGRATION = '1'`，运行 `node scripts/w9-chain-acceptance.cjs`。脚本创建隔离资源，检查真实 HTTP → Kafka → Collector → ClickHouse，并清理本次数据和进程。Collector 使用构建产物；2026-10-02 的独立复验已确认 Node v24.0.0 / tsx 4.23.15 下 `tsx watch src/main.ts` 成功订阅 Kafka，历史 Node20 失败记录保留，不据此声明整套 `pnpm dev` 已通过。
 
 ## Phase 2 W11–W14
 
@@ -88,6 +90,20 @@ Compose 中的凭证仅供绑定到 localhost 的个人开发环境使用；不�
 新增管理员保护的 `/api/v1/metrics/overview`、`/api/v1/metrics/ai`：去重后的请求/失败量、P50/P95/P99、Token、按模型的延迟/TTFT，以及 RAG 成功/空召回和召回/重排耗时。支持项目、环境、服务、常用范围及明确 UTC 窗口；敏感内容仍默认屏蔽。前端真实 Trace/AI 页面切换在 W18–W20，本轮不修改 mock 页面；旧 `/overview` 暂留兼容。
 
 本地构建后设置 `$env:TRACE_OPS_RUN_INTEGRATION = '1'`，运行 `node scripts/w15-metrics-acceptance.cjs`。真实管道验证聚合语义，隔离的 10,000 请求 / 51,000 存储行基线测量 1h/24h/7d HTTP 查询 P95，清理本次资源；证据在 `output/acceptance/w15-metrics-result.json`。指标口径和有限读取边界见 `apps/api/README.md`。
+
+## Phase 2 W18–W20
+
+总览、最新 Trace、Trace 检索/详情执行树、模型用量和 RAG 指标已接真实接口。全局项目、环境和时间范围切换会取消旧请求；空数据、加载和失败重试明确显示，不回退成演示数据。详情提示查询窗口、孤儿/环、多根及 2,000 Span 截断；未观测到的 usage/TTFT 显示“—”。保持原有浅暖白页面样式。
+
+本地 Web 通过 Vite 服务端读取 `PLATFORM_ADMIN_TOKEN`，只代理同源、loopback、合法参数的管理 GET 查询；不要放入 `VITE_*`、URL 或浏览器存储。修改 `.env` 后重启 Web。该代理不用于 preview/生产，也不替代正式登录和项目成员 RBAC。告警、项目设置仍为演示；价格、评估、通知能力留待后续阶段。
+
+本地端到端验收先运行 `pnpm build`，启动 Compose，然后设置 `$env:TRACE_OPS_RUN_INTEGRATION='1'` 并运行 `node scripts/w18-page-acceptance-session.cjs`（保持终端开启）。脚本输出随机 `webUrl`；另一个终端使用 Playwright CLI 打开该 URL，再运行 `scripts/w18-browser-acceptance.js`。将 CLI 返回的 Result JSON 保存为 `output/acceptance/w18-browser-result.json`，回到验收终端输入 `verify`，继续回查入库结果并自动清理。未完成时输入 `finish`，报告失败并清理；30 分钟超时也会清理。请串行运行，不同时启动多个 W18 验收会话。
+
+可继续运行 `scripts/w18-browser-state-acceptance.js` 检查总览、Trace 列表和详情的空态/失败重试，并将它返回的 checks 合并到相同 run 的浏览器报告。CLI 命令形式为 `npx --yes --package @playwright/cli playwright-cli -s=w18-review open <webUrl>` 和 `npx --yes --package @playwright/cli playwright-cli -s=w18-review run-code --filename <脚本路径>`。
+
+浏览器成功读取均来自真实 API；只在加载/错误/竞态测试时注入网络故障。独立本地协议服务替代付费模型/Qdrant 响应，Kafka、已构建 Collector、ClickHouse 为真实实例。结果在 `output/acceptance/w18-page-result.json`，详细检查与限制见 `.agents/Documents/项目计划/W18-W20-页面真实链路与独立验收.md`。
+
+G2 验收分清两条边界：已经验证浏览器生成的 Trace ID 与服务端/RAG/LLM 树关联；尚未验证 Web 性能/异常事件与服务端的完整联合执行树或跨服务 parent 上下文，该项属于 Phase 3/G3。控制台接入文档提供原生 HTTP 上报示例，不要求安装尚未发布的 SDK；密钥只由可信服务端持有，项目创建与服务注册使用 [API 管理接口](apps/api/README.md)，演示设置页不能创建或复制真实密钥。
 
 ## W8 本地真实链路验收
 

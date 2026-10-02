@@ -125,7 +125,7 @@ test('sends Qdrant query points request and records only bounded opaque source m
     assert.equal(outer.attributes['rag.recalled_count'], 1);
     assert.equal(outer.attributes['rag.empty'], false);
     assert.equal(typeof outer.attributes['rag.recall_ms'], 'number');
-    assert.equal(outer.attributes['rag.rerank_ms'], 0);
+    assert.equal(Object.hasOwn(outer.attributes, 'rag.rerank_ms'), false);
     const expectedHash = createHash('sha256').update(pointId, 'utf8').digest('hex');
     assert.deepEqual(outer.attributes.sources, [expectedHash]);
 
@@ -270,6 +270,8 @@ test('rerank callback runs in its child span, may reorder or select points, and 
     const rerank = observationEvent(tracing.events, 'rag.rerank');
     assert.equal(rerank.parentSpanId, outer.spanId);
     assert.equal(typeof outer.attributes['rag.rerank_ms'], 'number');
+    assert(Number.isFinite(outer.attributes['rag.rerank_ms']));
+    assert(outer.attributes['rag.rerank_ms'] >= 0);
     assert.deepEqual(outer.attributes['rag.rerank_before'].items.map(item => item.rank), [1, 2]);
     assert.deepEqual(outer.attributes['rag.rerank_after'].items.map(item => item.rank), [1, 2]);
     assert.deepEqual(outer.attributes['rag.rerank_after'].items.map(item => item.score), [0.99, 0.7]);
@@ -353,6 +355,9 @@ test('callback exceptions are safe provider errors and never enter span attribut
     parent.end();
     const outer = observationEvent(tracing.events);
     assert.equal(outer.attributes['ai.error_category'], 'provider_error');
+    assert.equal(typeof outer.attributes['rag.rerank_ms'], 'number');
+    assert(Number.isFinite(outer.attributes['rag.rerank_ms']));
+    assert(outer.attributes['rag.rerank_ms'] >= 0);
     assert.equal(JSON.stringify(tracing.events).includes(callbackCanary), false);
   });
 });

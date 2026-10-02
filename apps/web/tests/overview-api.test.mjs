@@ -27,16 +27,17 @@ const generatedAt = '2026-09-26T08:30:00.000Z';
 const overviewPayload = {
   generatedAt,
   range: { key: '24h', from: '2026-09-25T08:30:00.000Z', to: generatedAt },
-  metrics: { requestCount: 1250, errorCount: 12, errorRate: 0.0096, p95LatencyMs: 1680, totalTokens: 64000 },
-  series: [{ bucketStart: '2026-09-26T08:00:00.000Z', requestCount: 140, errorCount: 2, errorRate: 0.0143 }],
+  metrics: { requestCount: 1250, errorCount: 12, errorRate: 0.0096, p50LatencyMs: 320, p95LatencyMs: 1680, p99LatencyMs: 2410, totalTokens: 64000 },
+  series: [{ bucketStart: '2026-09-26T08:00:00.000Z', requestCount: 140, errorCount: 2, errorRate: 0.0143, totalTokens: 5100 }],
   services: [{
     name: 'assistant-api', requestCount: 1250, errorCount: 12, errorRate: 0.0096,
-    p95LatencyMs: 1680, lastSeenAt: generatedAt, status: 'degraded',
+    p50LatencyMs: 320, p95LatencyMs: 1680, p99LatencyMs: 2410, lastSeenAt: generatedAt, status: 'degraded',
   }],
   recentErrors: [{
-    traceId: 'trace-123', service: 'assistant-api', operation: 'POST /chat',
+    traceId: 'trace-123', environment: 'staging', service: 'assistant-api', operation: 'POST /chat',
     startTime: generatedAt, durationMs: 1680,
   }],
+  topModels: [{ model: 'gpt-4o-mini', callCount: 950, totalTokens: 64000, p95LatencyMs: 780 }],
 };
 
 test('projects endpoint maps the existing direct array response and preserves an empty result', () => {
@@ -57,11 +58,12 @@ test('overview request uses the selected project, environment and range, and map
 
   try {
     const result = await overview.fetchOverview({ projectId: 'project-1', environment: 'staging', range: '24h' });
-    assert.equal(requestedUrl, '/api/v1/overview?projectId=project-1&environment=staging&range=24h');
+    assert.equal(requestedUrl, '/api/v1/metrics/overview?projectId=project-1&environment=staging&range=24h');
     assert.deepEqual(result.metrics, overviewPayload.metrics);
     assert.deepEqual(result.series, overviewPayload.series);
     assert.deepEqual(result.services, overviewPayload.services);
     assert.deepEqual(result.recentErrors, overviewPayload.recentErrors);
+    assert.deepEqual(result.topModels, overviewPayload.topModels);
     assert.equal(overview.hasOverviewData(result), true);
   } finally {
     globalThis.fetch = originalFetch;
@@ -97,10 +99,11 @@ test('overview response with a different range or malformed service status is re
 test('no-data response is distinguishable from non-empty observations', () => {
   const empty = overview.parseOverviewPayload({
     ...overviewPayload,
-    metrics: { requestCount: 0, errorCount: 0, errorRate: 0, p95LatencyMs: 0, totalTokens: 0 },
+    metrics: { requestCount: 0, errorCount: 0, errorRate: 0, p50LatencyMs: 0, p95LatencyMs: 0, p99LatencyMs: 0, totalTokens: 0 },
     series: [],
     services: [{ ...overviewPayload.services[0], requestCount: 0, errorCount: 0, errorRate: 0, status: 'no_data' }],
     recentErrors: [],
+    topModels: [],
   });
   assert.equal(overview.hasOverviewData(empty), false);
 });
