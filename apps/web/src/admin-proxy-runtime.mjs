@@ -6,6 +6,9 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_ALERT_STATE_BODY_BYTES = 1024;
 const MAX_ALERT_CHANNEL_BODY_BYTES = 8192;
 const MAX_ALERT_ACTION_BODY_BYTES = 512;
+const MAX_PROJECT_SERVICE_BODY_BYTES = 1024;
+const MAX_PROJECT_KEY_BODY_BYTES = 4096;
+const MAX_PROJECT_PRIVACY_BODY_BYTES = 32 * 1024;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TRACE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
@@ -41,7 +44,7 @@ const SAFE_ERRORS = {
   method: {
     status: 405,
     error: 'method_not_allowed',
-    message: '本地管理代理仅允许白名单读取和告警状态修改。',
+    message: '本地管理代理仅允许白名单读取和配置变更。',
   },
   notAllowed: {
     status: 404,
@@ -67,6 +70,21 @@ const SAFE_ERRORS = {
     status: 400,
     error: 'invalid_alert_action_body',
     message: '告警通知操作请求体必须只包含有效的 projectId。',
+  },
+  invalidProjectServiceBody: {
+    status: 400,
+    error: 'invalid_project_service_body',
+    message: '服务请求体必须只包含有效的 name 与 environment。',
+  },
+  invalidProjectPrivacyBody: {
+    status: 400,
+    error: 'invalid_project_privacy_body',
+    message: '隐私策略请求体必须只包含有效的 additionalRedactedFields。',
+  },
+  invalidProjectKeyBody: {
+    status: 400,
+    error: 'invalid_project_key_body',
+    message: '项目凭证请求体必须只包含有效的 name 与 scopes。',
   },
   missingCredential: {
     status: 401,
@@ -98,6 +116,23 @@ function isAdminPathCandidate(pathname) {
 
 function exactRoute(pathname) {
   if (pathname === '/api/v1/projects') return { name: 'projects', path: pathname };
+
+  const projectAuditMatch = pathname.match(/^\/api\/v1\/projects\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/audit-logs$/i);
+  if (projectAuditMatch) return { name: 'projectAuditLogs', path: pathname, projectId: projectAuditMatch[1] };
+  const projectKeyRotateMatch = pathname.match(/^\/api\/v1\/projects\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/keys\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/rotate$/i);
+  if (projectKeyRotateMatch) return { name: 'projectKeyRotate', path: pathname, projectId: projectKeyRotateMatch[1], keyId: projectKeyRotateMatch[2] };
+  const projectKeyMatch = pathname.match(/^\/api\/v1\/projects\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/keys(?:\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}))?$/i);
+  if (projectKeyMatch) return {
+    name: projectKeyMatch[2] ? 'projectKey' : 'projectKeys',
+    path: pathname,
+    projectId: projectKeyMatch[1],
+    ...(projectKeyMatch[2] ? { keyId: projectKeyMatch[2] } : {}),
+  };
+  const projectPrivacyMatch = pathname.match(/^\/api\/v1\/projects\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/privacy$/i);
+  if (projectPrivacyMatch) return { name: 'projectPrivacy', path: pathname, projectId: projectPrivacyMatch[1] };
+  const projectServicesMatch = pathname.match(/^\/api\/v1\/projects\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/services$/i);
+  if (projectServicesMatch) return { name: 'projectServices', path: pathname, projectId: projectServicesMatch[1] };
+
   if (pathname === '/api/v1/overview') return { name: 'overview', path: pathname };
   if (pathname === '/api/v1/metrics/overview') return { name: 'metricsOverview', path: pathname };
   if (pathname === '/api/v1/metrics/ai') return { name: 'metricsAi', path: pathname };
@@ -371,6 +406,23 @@ function parseStrictJsonObject(rawBody, maximumBytes) {
       skipWhitespace();
       let value;
       if (rawBody[index] === '"') value = readString();
+      else if (rawBody[index] === '[') {
+        index += 1;
+        value = [];
+        skipWhitespace();
+        if (rawBody[index] !== ']') {
+          while (index < rawBody.length) {
+            skipWhitespace();
+            const entry = readString();
+            if (typeof entry !== 'string') return undefined;
+            value.push(entry);
+            skipWhitespace();
+            if (rawBody[index] === ']') break;
+            if (rawBody[index++] !== ',') return undefined;
+          }
+        }
+        if (rawBody[index++] !== ']') return undefined;
+      }
       else if (rawBody.startsWith('true', index)) {
         value = true;
         index += 4;
@@ -458,6 +510,39 @@ export function validateAlertActionBody(rawBody) {
     : SAFE_ERRORS.invalidAlertActionBody;
 }
 
+export function validateProjectServiceBody(rawBody) {
+  const body = parseStrictJsonObject(rawBody, MAX_PROJECT_SERVICE_BODY_BYTES);
+  return body && Object.keys(body).length === 2 && Object.keys(body).every((key) => key === 'name' || key === 'environment')
+    && validChannelName(body.name) && ENVIRONMENTS.has(body.environment)
+    ? { valid: true, value: { name: body.name, environment: body.environment } }
+    : SAFE_ERRORS.invalidProjectServiceBody;
+}
+
+export function validateProjectPrivacyBody(rawBody) {
+  const body = parseStrictJsonObject(rawBody, MAX_PROJECT_PRIVACY_BODY_BYTES);
+  if (!body || Object.keys(body).length !== 1 || !Array.isArray(body.additionalRedactedFields)
+    || body.additionalRedactedFields.length > 64) return SAFE_ERRORS.invalidProjectPrivacyBody;
+  const normalized = new Set();
+  for (const field of body.additionalRedactedFields) {
+    if (typeof field !== 'string' || !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(field)) return SAFE_ERRORS.invalidProjectPrivacyBody;
+    const key = field.toLocaleLowerCase('en-US');
+    if (normalized.has(key)) return SAFE_ERRORS.invalidProjectPrivacyBody;
+    normalized.add(key);
+  }
+  return { valid: true, value: { additionalRedactedFields: body.additionalRedactedFields } };
+}
+
+export function validateProjectKeyBody(rawBody) {
+  const body = parseStrictJsonObject(rawBody, MAX_PROJECT_KEY_BODY_BYTES);
+  const allowedScopes = new Set(['spans:write', 'trace:read']);
+  return body && Object.keys(body).length === 2 && Object.keys(body).every((key) => key === 'name' || key === 'scopes')
+    && validChannelName(body.name) && Array.isArray(body.scopes) && body.scopes.length === 1
+    && body.scopes.every((scope) => typeof scope === 'string' && allowedScopes.has(scope))
+    && new Set(body.scopes).size === body.scopes.length
+    ? { valid: true, value: { name: body.name, scopes: body.scopes } }
+    : SAFE_ERRORS.invalidProjectKeyBody;
+}
+
 /** Validate query values against the matching backend controller DTO rules. */
 export function validateAdminQuery(route, rawQuery, method) {
   const query = queryMap(rawQuery);
@@ -467,6 +552,19 @@ export function validateAdminQuery(route, rawQuery, method) {
   switch (route.name) {
     case 'projects':
       result = query.size === 0;
+      break;
+    case 'projectServices':
+    case 'projectPrivacy':
+    case 'projectKeys':
+    case 'projectKey':
+    case 'projectKeyRotate':
+      result = UUID_PATTERN.test(route.projectId ?? '')
+        && (route.keyId === undefined || UUID_PATTERN.test(route.keyId))
+        && query.size === 0;
+      break;
+    case 'projectAuditLogs':
+      result = UUID_PATTERN.test(route.projectId ?? '') && query.size === 2
+        && query.get('page') === '1' && query.get('pageSize') === '20';
       break;
     case 'overview':
       result = validOverviewQuery(query);
@@ -871,7 +969,13 @@ export function createAdminProxy(options = {}) {
       return;
     }
 
-    const allowedMethods = inspected.route.name === 'alertState' ? ['PATCH']
+    const allowedMethods = inspected.route.name === 'projectServices' ? ['GET', 'POST']
+      : inspected.route.name === 'projectPrivacy' ? ['GET', 'PATCH']
+        : inspected.route.name === 'projectKeys' ? ['GET', 'POST']
+          : inspected.route.name === 'projectKey' ? ['DELETE']
+            : inspected.route.name === 'projectKeyRotate' ? ['POST']
+              : inspected.route.name === 'projectAuditLogs' ? ['GET']
+                : inspected.route.name === 'alertState' ? ['PATCH']
       : inspected.route.name === 'alertChannels' ? ['GET', 'POST']
         : inspected.route.name === 'alertChannel' ? ['PATCH', 'DELETE']
           : inspected.route.name === 'alertChannelTest' || inspected.route.name === 'alertDeliveryRetry' ? ['POST']
@@ -883,7 +987,7 @@ export function createAdminProxy(options = {}) {
       return;
     }
 
-    const bodylessMethod = request.method === 'GET' || request.method === 'DELETE';
+    const bodylessMethod = request.method === 'GET' || request.method === 'DELETE' || inspected.route.name === 'projectKeyRotate';
     if (bodylessMethod && hasRequestBody(request)) {
       request.resume?.();
       sendSafeError(response, SAFE_ERRORS.bodyNotAllowed);
@@ -926,6 +1030,18 @@ export function createAdminProxy(options = {}) {
     }
     if (request.method === 'POST' && (inspected.route.name === 'alertChannelTest' || inspected.route.name === 'alertDeliveryRetry')) {
       readAndForward(MAX_ALERT_ACTION_BODY_BYTES, SAFE_ERRORS.invalidAlertActionBody, validateAlertActionBody);
+      return;
+    }
+    if (request.method === 'POST' && inspected.route.name === 'projectServices') {
+      readAndForward(MAX_PROJECT_SERVICE_BODY_BYTES, SAFE_ERRORS.invalidProjectServiceBody, validateProjectServiceBody);
+      return;
+    }
+    if (request.method === 'PATCH' && inspected.route.name === 'projectPrivacy') {
+      readAndForward(MAX_PROJECT_PRIVACY_BODY_BYTES, SAFE_ERRORS.invalidProjectPrivacyBody, validateProjectPrivacyBody);
+      return;
+    }
+    if (request.method === 'POST' && inspected.route.name === 'projectKeys') {
+      readAndForward(MAX_PROJECT_KEY_BODY_BYTES, SAFE_ERRORS.invalidProjectKeyBody, validateProjectKeyBody);
       return;
     }
 

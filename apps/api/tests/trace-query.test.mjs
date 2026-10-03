@@ -25,11 +25,11 @@ test('trace detail requires explicit project/environment and rejects content acc
   assert.throws(() => parseTraceDetailQuery('trace-valid', { ...base, includeContent: 'true' }), error => error.getStatus() === 403);
   assert.throws(() => parseTraceDetailQuery('unsafe/id', base), error => error.getStatus() === 400);
 });
-test('traces controller applies the platform admin guard to both read endpoints', () => {
+test('traces controller applies read-only project-key/admin guard to both read endpoints', () => {
   const { GUARDS_METADATA, PATH_METADATA } = require('@nestjs/common/constants');
-  const { AdminTokenGuard } = require('../dist/admin/admin-token.guard.js');
+  const { TraceReadGuard } = require('../dist/traces/trace-read.guard.js');
   const { TracesController } = require('../dist/traces/traces.controller.js');
-  assert.deepEqual(Reflect.getMetadata(GUARDS_METADATA, TracesController), [AdminTokenGuard]);
+  assert.deepEqual(Reflect.getMetadata(GUARDS_METADATA, TracesController), [TraceReadGuard]);
   assert.equal(Reflect.getMetadata(PATH_METADATA, TracesController), 'traces');
   const controller = new TracesController({ list: q => q }, { detail: (id, q) => ({ id, q }) });
   assert.deepEqual(controller.list(base), base);

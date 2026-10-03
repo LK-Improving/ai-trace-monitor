@@ -96,7 +96,11 @@ test('public ingest contract carries the project key but rejects caller-supplied
     false,
   );
   assert.equal(contracts.ProjectKeyScopeSchema.parse('spans:write'), 'spans:write');
+  assert.equal(contracts.ProjectKeyScopeSchema.parse('trace:read'), 'trace:read');
   assert.equal(contracts.ProjectKeyScopeSchema.safeParse('traces:read').success, false);
+  assert.deepEqual(contracts.ProjectKeyScopesSchema.parse(['spans:write']), ['spans:write']);
+  assert.deepEqual(contracts.ProjectKeyScopesSchema.parse(['trace:read']), ['trace:read']);
+  assert.equal(contracts.ProjectKeyScopesSchema.safeParse(['spans:write', 'trace:read']).success, false);
 });
 
 test('Span schemas reject inverted time ranges and oversized ingest batches', () => {
@@ -130,6 +134,30 @@ test('attribute redaction removes prompt, response, and credential fields recurs
     model: 'gpt-example',
     nested: { 'http.status_code': 200 },
   });
+});
+
+test('project-specific additional fields are recursively redacted and policy input is bounded', () => {
+  const redacted = contracts.redactSpanAttributes({
+    accountEmail: 'private@example.test',
+    nested: { accountEmail: 'nested-private@example.test', safe: 'kept' },
+    entries: [{ accountemail: 'array-private@example.test', visible: true }],
+  }, ['accountemail']);
+  assert.deepEqual(redacted, { nested: { safe: 'kept' }, entries: [{ visible: true }] });
+
+  assert.deepEqual(contracts.ProjectPrivacyPolicyPatchSchema.parse({
+    additionalRedactedFields: ['AccountEmail', 'customer_id'],
+    capturePromptResponse: false,
+  }), { additionalRedactedFields: ['accountemail', 'customer_id'], capturePromptResponse: false });
+  for (const invalid of [
+    { additionalRedactedFields: Array.from({ length: 65 }, (_, index) => `field${index}`) },
+    { additionalRedactedFields: ['a'.repeat(65)] },
+    { additionalRedactedFields: ['customer.email'] },
+    { additionalRedactedFields: ['Email', 'email'] },
+    { capturePromptResponse: true },
+    {},
+  ]) {
+    assert.equal(contracts.ProjectPrivacyPolicyPatchSchema.safeParse(invalid).success, false);
+  }
 });
 
 test('ClickHouse row mapping matches trace_spans columns and never persists project keys', () => {

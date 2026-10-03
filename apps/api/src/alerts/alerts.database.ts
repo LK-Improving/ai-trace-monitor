@@ -16,7 +16,12 @@ function alertSchemaSql(): string {
   if (configuredPath) {
     const path = resolve(configuredPath);
     if (!existsSync(path)) throw new Error('Alert schema migration file is unavailable');
-    return readFileSync(path, 'utf8');
+    const roots = [process.cwd(), resolve(process.cwd(), '../..'), resolve(__dirname, '../../../../')];
+    const securityMigration = roots
+      .map((root) => resolve(root, 'infra/postgres/init/004-project-access-privacy-audit.sql'))
+      .find(existsSync);
+    if (!securityMigration) throw new Error('Project access migration file is unavailable');
+    return [readFileSync(path, 'utf8'), readFileSync(securityMigration, 'utf8')].join('\n');
   }
   const roots = [
     process.cwd(),
@@ -27,6 +32,7 @@ function alertSchemaSql(): string {
     const paths = [
       resolve(root, 'infra/postgres/init/002-alerts.sql'),
       resolve(root, 'infra/postgres/init/003-alert-notifications.sql'),
+      resolve(root, 'infra/postgres/init/004-project-access-privacy-audit.sql'),
     ];
     if (paths.every(existsSync)) return paths.map((path) => readFileSync(path, 'utf8')).join('\n');
   }

@@ -8,9 +8,13 @@ import {
   validateAlertChannelBody,
   validateAlertStateBody,
   validateLocalSameOrigin,
+  validateProjectKeyBody,
+  validateProjectPrivacyBody,
+  validateProjectServiceBody,
 } from '../src/admin-proxy-runtime.mjs';
 
 const projectId = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+const keyId = 'c47ac10b-58cc-4372-a567-0e02b2c3d472';
 const startTime = '2026-01-01T00:00:00Z';
 const endTime = '2026-01-31T00:00:00Z';
 const testToken = 'synthetic-admin-token-for-tests';
@@ -169,12 +173,22 @@ test('accepts only exact admin route shapes in origin-form', () => {
     '/api/v1/alerts',
     '/api/v1/alerts/summary',
     `/api/v1/alerts/${projectId}/state`,
+    `/api/v1/projects/${projectId}/services`,
+    `/api/v1/projects/${projectId}/privacy`,
+    `/api/v1/projects/${projectId}/keys`,
+    `/api/v1/projects/${projectId}/keys/${projectId}`,
+    `/api/v1/projects/${projectId}/keys/${projectId}/rotate`,
+    `/api/v1/projects/${projectId}/audit-logs`,
   ];
   for (const path of accepted) assert.equal(inspectAdminRequestTarget(path)?.valid, true, path);
 
   const rejected = [
     '/api/v1/projects/',
     '/api/v1/projects/project-1/keys',
+    '/api/v1/projects/not-a-uuid/services',
+    `/api/v1/projects/${projectId}/keys/not-a-uuid`,
+    `/api/v1/projects/${projectId}/keys/${projectId}/rotate/extra`,
+    `/api/v1/projects/${projectId}/audit-logs/export`,
     '/api/v1/metrics/overview/export',
     '/api/v1/traces/trace_v1_abc/nested',
     '/api/v1/traces/',
@@ -204,6 +218,54 @@ test('accepts only exact admin route shapes in origin-form', () => {
     '/favicon.svg',
   ];
   for (const path of viteStaticTargets) assert.equal(inspectAdminRequestTarget(path), undefined, path);
+});
+
+test('project settings query and request bodies allow only the agreed DTO fields', () => {
+  for (const [path, query, method] of [
+    [`/api/v1/projects/${projectId}/services`, '', 'GET'],
+    [`/api/v1/projects/${projectId}/privacy`, '', 'PATCH'],
+    [`/api/v1/projects/${projectId}/keys`, '', 'POST'],
+    [`/api/v1/projects/${projectId}/keys/${keyId}`, '', 'DELETE'],
+    [`/api/v1/projects/${projectId}/keys/${keyId}/rotate`, '', 'POST'],
+    [`/api/v1/projects/${projectId}/audit-logs`, 'page=1&pageSize=20', 'GET'],
+  ]) assert.equal(validateAdminQuery(routeFor(path), query, method).valid, true, `${method} ${path}?${query}`);
+
+  const audit = routeFor(`/api/v1/projects/${projectId}/audit-logs`);
+  for (const query of ['', 'limit=20', 'page=2&pageSize=20', 'page=1&pageSize=21', 'page=1', 'page=1&pageSize=20&projectId=' + projectId, 'page=1&page=1&pageSize=20']) {
+    assert.equal(validateAdminQuery(audit, query, 'GET').valid, false, query);
+  }
+
+  assert.deepEqual(validateProjectServiceBody('{"name":"assistant-api","environment":"prod"}'), {
+    valid: true, value: { name: 'assistant-api', environment: 'prod' },
+  });
+  assert.deepEqual(validateProjectPrivacyBody('{"additionalRedactedFields":["customer_email"]}'), {
+    valid: true, value: { additionalRedactedFields: ['customer_email'] },
+  });
+  assert.deepEqual(validateProjectKeyBody('{"name":"read-key","scopes":["trace:read"]}'), {
+    valid: true, value: { name: 'read-key', scopes: ['trace:read'] },
+  });
+
+  for (const body of [
+    '{"name":"api","environment":"production"}',
+    '{"name":"api","environment":"dev","sdkVersion":"0.1"}',
+    '{"name":"api","name":"other","environment":"dev"}',
+  ]) assert.equal(validateProjectServiceBody(body).valid, undefined, body);
+  for (const body of [
+    '{"additionalRedactedFields":["email","EMAIL"]}',
+    '{"additionalRedactedFields":["customer.email"]}',
+    '{"additionalRedactedFields":["_private"]}',
+    JSON.stringify({ additionalRedactedFields: ['a'.repeat(65)] }),
+    '{"additionalRedactedFields":[],"capturePromptResponse":true}',
+    '{"additionalRedactedFields":["safe"],"additionalRedactedFields":[]}',
+    JSON.stringify({ additionalRedactedFields: Array.from({ length: 65 }, (_, index) => `field_${index}`) }),
+  ]) assert.equal(validateProjectPrivacyBody(body).valid, undefined, body);
+  for (const body of [
+    '{"name":"key","scopes":[]}',
+    '{"name":"key","scopes":["spans:write","trace:read"]}',
+    '{"name":"key","scopes":["spans:write","spans:write"]}',
+    '{"name":"key","scopes":["trace:content:read"]}',
+    '{"name":"key","scopes":["spans:write"],"projectId":"' + projectId + '"}',
+  ]) assert.equal(validateProjectKeyBody(body).valid, undefined, body);
 });
 
 test('projects and legacy overview queries follow their exact DTO field sets', () => {
@@ -524,6 +586,64 @@ test('middleware forwards only the exact same-origin alert state PATCH with a no
   assert.equal(noContent.status, 204);
   assert.equal(noContent.body, '');
   upstreamMode = { status: 200, body: JSON.stringify({ ok: true }) };
+});
+
+test('project configuration proxy forwards only scoped routes and validated bodies with the server credential', async () => {
+  const beforeCount = upstreamRequests.length;
+  const calls = [
+    { path: `/api/v1/projects/${projectId}/services`, method: 'GET' },
+    { path: `/api/v1/projects/${projectId}/privacy`, method: 'GET' },
+    { path: `/api/v1/projects/${projectId}/keys`, method: 'GET' },
+    { path: `/api/v1/projects/${projectId}/audit-logs?page=1&pageSize=20`, method: 'GET' },
+    { path: `/api/v1/projects/${projectId}/services`, method: 'POST', body: { name: 'assistant-api', environment: 'dev' } },
+    { path: `/api/v1/projects/${projectId}/privacy`, method: 'PATCH', body: { additionalRedactedFields: ['customer_email'] } },
+    { path: `/api/v1/projects/${projectId}/keys`, method: 'POST', body: { name: 'read-only', scopes: ['trace:read'] } },
+    { path: `/api/v1/projects/${projectId}/keys/${keyId}/rotate`, method: 'POST' },
+    { path: `/api/v1/projects/${projectId}/keys/${keyId}`, method: 'DELETE' },
+  ];
+
+  for (const call of calls) {
+    const response = await get(call.path, {
+      method: call.method,
+      headers: {
+        ...localHeaders(),
+        authorization: 'Bearer browser-controlled-token',
+        ...(call.body ? { 'content-type': 'application/json' } : {}),
+      },
+      ...(call.body ? { body: JSON.stringify(call.body) } : {}),
+    });
+    assert.equal(response.status, 200, `${call.method} ${call.path}`);
+    assert.deepEqual(JSON.parse(response.body), { ok: true });
+  }
+
+  const forwarded = upstreamRequests.slice(beforeCount);
+  assert.equal(forwarded.length, calls.length);
+  calls.forEach((call, index) => {
+    assert.equal(forwarded[index].method, call.method);
+    assert.equal(forwarded[index].url, call.path);
+    assert.equal(forwarded[index].authorization, `Bearer ${testToken}`);
+    assert.equal(forwarded[index].clientAuthorization, undefined);
+    assert.equal(forwarded[index].body, call.body ? JSON.stringify(call.body) : '');
+  });
+
+  const beforeRejected = upstreamRequests.length;
+  const malformed = await get(`/api/v1/projects/${projectId}/keys`, {
+    method: 'POST',
+    headers: { ...localHeaders(), 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'bad', scopes: ['spans:write'], token: 'must-not-forward' }),
+  });
+  assert.equal(malformed.status, 400);
+  const bodyOnRotate = await get(`/api/v1/projects/${projectId}/keys/${keyId}/rotate`, {
+    method: 'POST',
+    headers: { ...localHeaders(), 'content-type': 'application/json', 'content-length': '2' },
+    body: '{}',
+  });
+  assert.equal(bodyOnRotate.status, 400);
+  const crossOrigin = await get(`/api/v1/projects/${projectId}/privacy`, {
+    headers: { origin: 'http://evil.example', 'sec-fetch-site': 'cross-site' },
+  });
+  assert.equal(crossOrigin.status, 403);
+  assert.equal(upstreamRequests.length, beforeRejected);
 });
 
 test('middleware rejects every other PATCH route, query, origin, and body before contacting the API', async () => {

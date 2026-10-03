@@ -36,7 +36,7 @@ HTTP 202 的 `delivery: "queued_in_memory"` 仅表示数据进入有界内存队
 | `POST` | `/api/v1/projects/:projectId/keys` | 创建项目密钥：`{ "name": "local-sdk" }`；响应中的 `key` 只展示一次 |
 | `DELETE` | `/api/v1/projects/:projectId/keys/:keyId` | 撤销密钥（设置 `revokedAt`，重复撤销幂等） |
 
-环境只接受 `dev`、`staging`、`prod`。项目/服务/密钥创建严格拒绝未声明字段；项目 slug 唯一，服务按现有表约束以项目、名称、环境组合唯一。项目密钥格式为 `tr_` + 32 字节 Base64URL；数据库只保存 SHA-256 Hash 与用于识别的前缀，Scope 固定为 `spans:write`。
+环境只接受 `dev`、`staging`、`prod`。项目/服务/密钥创建严格拒绝未声明字段；项目 slug 唯一，服务按现有表约束以项目、名称、环境组合唯一。项目密钥格式为 `tr_` + 32 字节 Base64URL；数据库只保存 SHA-256 Hash 与用于识别的前缀。密钥 scope 为单项 `spans:write` 或 `trace:read`，具体行为见 W26–W29 小节。
 
 Overview 的全局请求量、错误数、P95 与趋势按根 Span（`parent_span_id = ''`）统计，排除 `browser.web_vital`、`browser.javascript_error`、`browser.unhandled_rejection` 这些非请求诊断事件，避免把性能事件或同一 Trace 的 RAG/LLM 子 Span 重复算成多次请求。`browser.network_error` 记录失败的网络请求，参与该指标；当前 SDK 不采集成功网络请求，因此仅有浏览器事件的项目不应把该错误率视为全站请求错误率。Token 合计只统计带模型标识或 `llm.generate` 操作的 Span，避免根 Span 复制 Token 用量造成双计。服务状态按全部服务 Span/事件聚合：错误率达到 1% 为 `degraded`，窗口内没有 Span 为 `no_data`。该阈值用于当前 MVP 展示，后续规则配置化另行排期。
 
@@ -178,3 +178,16 @@ Webhook 默认限定 HTTPS，API 对 DNS 解析结果校验公网地址并固定
 回归验证：`pnpm --filter @trace-ops/api test` 和 `node --test apps/collector/tests/*.test.mjs`。PostgreSQL 端到端幂等/状态测试默认跳过；PowerShell 中可从仓库根目录设置 `$env:TRACE_OPS_RUN_ALERTS_INTEGRATION='1'` 后运行 `node --env-file=.env --test apps/api/tests/alerts-postgres.integration.test.mjs`，完成后用 `Remove-Item Env:TRACE_OPS_RUN_ALERTS_INTEGRATION` 清除本次开关。该用例创建随机命名临时项目，并在结束时验证删除本次项目及级联数据。
 
 W24–W27 本机通知验收需要先启动 Compose Mailpit，再执行 `pnpm build`；PowerShell 中设置 `$env:TRACE_OPS_RUN_NOTIFICATIONS_INTEGRATION='1'` 并运行 `node --env-file=.env scripts/w24-27-notifications-acceptance.cjs`。脚本只接受 loopback PostgreSQL 与 `127.0.0.1:8025` Mailpit，使用临时加密密钥和独立项目/收件人，测试完成后清理；它会启动隔离 API/Web 并等待浏览器验收，在浏览器测完后向该命令输入 `finish` 触发清理。JSON 验收摘要写入 `output/acceptance/w24-27-notifications-result.json`，临时浏览器入口写入 `w24-27-notifications-session.json`。不要启用或提交 `.env` 中的真实 SMTP 凭证。
+
+## W26–W29：项目访问控制、隐私策略与审计
+
+本阶段用 project API key 实现机器身份的最小读写隔离；没有用户登录/身份提供方，因此项目管理接口仍只接受服务端 `PLATFORM_ADMIN_TOKEN`，`members` 表不作为已生效的用户 RBAC，也不会接受请求体自报 actor。新审计记录统一使用 `actorId=platform_admin`。
+
+- API key scope 只允许 `spans:write` 和 `trace:read`，每把 key 必须且只能有一个 scope；需要读写能力时创建两把独立凭证。`POST /api/v1/projects/:projectId/keys` 接受 `{ "name": "api-prod", "scopes": ["spans:write"] }`；省略 `scopes` 时默认 `spans:write`。列表只返回 `keyPrefix` 与 `scopes` 等非秘密元数据；创建和轮换响应中的 `key` 仅展示一次，服务端只持久化 SHA-256 hash。迁移会撤销并规范化此前可能创建的组合/非法 scope key，需为对应用途分别重新创建凭证。
+- `POST /api/v1/projects/:projectId/keys/:keyId/rotate` 原子撤销旧 key、生成继承原 scope 的新 key，并返回新明文一次。`DELETE /api/v1/projects/:projectId/keys/:keyId` 为幂等撤销。密钥管理路由仍只由平台管理员保护。
+- Trace list/detail 可继续用管理员 Bearer 凭证，也可用 `Authorization: Bearer <project-key>`。项目 key 必须有 `trace:read`，并且请求必须显式指定 `projectId`；key 与查询项目不一致返回 403，无效或已撤销 key 返回 401。该授权只覆盖 Trace 读接口，不扩展到项目、密钥、服务、隐私策略或其他写 API。Span ingest 仍必须有 `spans:write`。
+- `GET /api/v1/projects/:projectId/privacy` 与 `PATCH` 读取/更新 `{ "additionalRedactedFields": ["customer_email", "tenant_id"], "capturePromptResponse": false }`。字段名递归匹配，最多 64 项、每项 1–64 个 ASCII 字母/数字/下划线/连字符，按大小写不敏感去重。`capturePromptResponse` 只能为 `false`；尝试开启返回 403。Span 入队前读取项目策略并在默认脱敏规则之外递归过滤这些字段；策略缺失、损坏或 Postgres 不可用时失败关闭，不会绕过脱敏。
+- 关键变更（服务创建、key 创建/轮换/撤销、隐私策略变更）与业务写入在同一 SQL 语句提交审计。审计不写 key/hash、Prompt/Response、用户原文或字段值；`GET /api/v1/projects/:projectId/audit-logs?page=1&pageSize=20` 仅接受 `page`、`pageSize` 两个正整数字符串参数（不接受 `limit` 等别名或重复数组值），page 默认 1、pageSize 默认 50/上限 100，最大 offset 10,000。响应条目安全投影为 `{ id, actorId, action, resource, createdAt }`：`id` 是 bigint 的十进制字符串，不含 `projectId`、`details` 或其他审计载荷。删除项目时 `project_id` 按既有 `ON DELETE SET NULL` 置空，审计行及其安全上下文保留；trigger 禁止直接 UPDATE、DELETE 和 TRUNCATE。
+- 服务接入 API 已由管理员凭证保护：`POST /api/v1/projects/:projectId/services` body 为 `{ "name": "api", "environment": "prod", "sdkVersion": "1.2.3" }`，环境只允许 `dev|staging|prod`；服务名在同一项目/环境内唯一。新建服务会同步写入安全审计元数据。`GET /api/v1/projects/:projectId/services` 查询接入配置。
+
+迁移 `infra/postgres/init/004-project-access-privacy-audit.sql` 有版本号且可重复应用；新建项目由数据库触发器自动获得默认隐私策略（不采集原文），已有项目在迁移时补齐默认策略。API 启动时会在与告警迁移相同的 PostgreSQL advisory lock 下应用 002–004，因此现有 Compose volume 不需删除或重建。测试：`pnpm --filter @trace-ops/api test` 与 `pnpm --filter @trace-ops/api typecheck`。可选 PostgreSQL migration 实测只允许 loopback：PowerShell 中设置 `$env:TRACE_OPS_RUN_PROJECT_SECURITY_INTEGRATION='1'` 后运行 `node --env-file=.env --test apps/api/tests/project-security.integration.test.mjs`；测试事务回滚临时数据，不会清理共享数据。

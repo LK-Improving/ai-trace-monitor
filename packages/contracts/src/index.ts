@@ -3,12 +3,37 @@ import { z } from 'zod';
 export const TRACE_ID_HEADER = 'x-trace-id' as const;
 export const PROJECT_KEY_FIELD = 'projectKey' as const;
 export const PROJECT_KEY_SCOPE = 'spans:write' as const;
+export const TRACE_READ_SCOPE = 'trace:read' as const;
+export const PROJECT_KEY_SCOPES = [PROJECT_KEY_SCOPE, TRACE_READ_SCOPE] as const;
 export const SPAN_SCHEMA_VERSION = 1 as const;
 
 export const EnvironmentSchema = z.enum(['dev', 'staging', 'prod']);
 export type Environment = z.infer<typeof EnvironmentSchema>;
 
-export const ProjectKeyScopeSchema = z.literal(PROJECT_KEY_SCOPE);
+export const ProjectKeyScopeSchema = z.enum(PROJECT_KEY_SCOPES);
+export type ProjectKeyScope = z.infer<typeof ProjectKeyScopeSchema>;
+export const ProjectKeyScopesSchema = z.array(ProjectKeyScopeSchema).length(1);
+
+export const AdditionalRedactedFieldSchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/)
+  .transform((value) => value.toLowerCase());
+
+export const AdditionalRedactedFieldsSchema = z.array(AdditionalRedactedFieldSchema).max(64)
+  .superRefine((fields, context) => {
+    if (new Set(fields).size !== fields.length) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: 'Duplicate redacted field' });
+    }
+  });
+
+export const ProjectPrivacyPolicyPatchSchema = z.object({
+  additionalRedactedFields: AdditionalRedactedFieldsSchema.optional(),
+  capturePromptResponse: z.literal(false).optional(),
+}).strict().refine((value) => Object.keys(value).length > 0);
+
+export type ProjectPrivacyPolicyPatch = z.infer<typeof ProjectPrivacyPolicyPatchSchema>;
 // `tr_` + base64url encoding of 32 random bytes (43 characters).
 export const ProjectKeySchema = z.string().regex(/^tr_[A-Za-z0-9_-]{43}$/);
 
@@ -117,22 +142,26 @@ export type SpanIngestBatch = z.infer<typeof SpanIngestBatchSchema>;
 const sensitiveAttributeName =
   /(prompt|response|user.?input|document.?content|completion.?text|raw.?messages?|authorization|password|credential|(?:api|project|private|secret|signing)[._-]?key|(?:api|project|access|refresh|auth|bearer|client)[._-]?token)/i;
 
-function redactValue(value: unknown, depth = 0): unknown {
+function redactValue(value: unknown, additionalFields: ReadonlySet<string>, depth = 0): unknown {
   if (depth > 8) return '[depth-limited]';
-  if (Array.isArray(value)) return value.slice(0, 100).map((entry) => redactValue(entry, depth + 1));
+  if (Array.isArray(value)) return value.slice(0, 100).map((entry) => redactValue(entry, additionalFields, depth + 1));
   if (value !== null && typeof value === 'object') {
     return Object.fromEntries(
       Object.entries(value)
-        .filter(([key]) => !sensitiveAttributeName.test(key))
-        .map(([key, entry]) => [key, redactValue(entry, depth + 1)]),
+        .filter(([key]) => !sensitiveAttributeName.test(key) && !additionalFields.has(key.toLowerCase()))
+        .map(([key, entry]) => [key, redactValue(entry, additionalFields, depth + 1)]),
     );
   }
   if (typeof value === 'string' && value.length > 4_000) return `${value.slice(0, 4_000)}…`;
   return value;
 }
 
-export function redactSpanAttributes(attributes: Record<string, unknown>): Record<string, unknown> {
-  return redactValue(attributes) as Record<string, unknown>;
+export function redactSpanAttributes(
+  attributes: Record<string, unknown>,
+  additionalRedactedFields: readonly string[] = [],
+): Record<string, unknown> {
+  const additionalFields = new Set(additionalRedactedFields.map((field) => field.toLowerCase()));
+  return redactValue(attributes, additionalFields) as Record<string, unknown>;
 }
 
 function toClickHouseDate(milliseconds: number): string {

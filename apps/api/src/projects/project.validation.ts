@@ -1,4 +1,10 @@
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException } from '@nestjs/common';
+import {
+  PROJECT_KEY_SCOPE,
+  ProjectKeyScope,
+  ProjectKeyScopesSchema,
+  ProjectPrivacyPolicyPatchSchema,
+} from '@trace-ops/contracts';
 
 export const ENVIRONMENTS = ['dev', 'staging', 'prod'] as const;
 export type ProjectEnvironment = (typeof ENVIRONMENTS)[number];
@@ -17,6 +23,17 @@ export interface CreateServiceInput {
 
 export interface CreateProjectKeyInput {
   name: string;
+  scopes: ProjectKeyScope[];
+}
+
+export interface ProjectPrivacyPolicyPatchInput {
+  additionalRedactedFields?: string[];
+  capturePromptResponse?: false;
+}
+
+export interface AuditLogsQuery {
+  page: number;
+  pageSize: number;
 }
 
 function invalidInput(): never {
@@ -74,6 +91,41 @@ export function parseCreateService(value: unknown): CreateServiceInput {
 }
 
 export function parseCreateProjectKey(value: unknown): CreateProjectKeyInput {
-  const input = asObject(value, ['name']);
-  return { name: requiredText(input.name, 120) };
+  const input = asObject(value, ['name', 'scopes']);
+  const scopesValue = input.scopes === undefined ? [PROJECT_KEY_SCOPE] : input.scopes;
+  const parsedScopes = ProjectKeyScopesSchema.safeParse(scopesValue);
+  if (!parsedScopes.success) return invalidInput();
+  return { name: requiredText(input.name, 120), scopes: parsedScopes.data };
+}
+
+export function parseProjectPrivacyPolicyPatch(value: unknown): ProjectPrivacyPolicyPatchInput {
+  if (
+    value !== null
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && 'capturePromptResponse' in value
+    && value.capturePromptResponse === true
+  ) {
+    throw new ForbiddenException('Prompt/Response capture is unavailable');
+  }
+  const parsed = ProjectPrivacyPolicyPatchSchema.safeParse(value);
+  if (!parsed.success) return invalidInput();
+  return parsed.data;
+}
+
+export function parseAuditLogsQuery(value: unknown): AuditLogsQuery {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return invalidInput();
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).some((key) => !['page', 'pageSize'].includes(key))) return invalidInput();
+  const parsePositiveInteger = (raw: unknown, fallback: number, maximum: number): number => {
+    if (raw === undefined) return fallback;
+    if (typeof raw !== 'string' || !/^[1-9]\d{0,5}$/.test(raw)) return invalidInput();
+    const parsed = Number(raw);
+    if (!Number.isSafeInteger(parsed) || parsed > maximum) return invalidInput();
+    return parsed;
+  };
+  const page = parsePositiveInteger(input.page, 1, 1000);
+  const pageSize = parsePositiveInteger(input.pageSize, 50, 100);
+  if ((page - 1) * pageSize > 10_000) return invalidInput();
+  return { page, pageSize };
 }

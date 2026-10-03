@@ -7,6 +7,7 @@ import {
 import { createHash, timingSafeEqual } from 'node:crypto';
 import {
   Environment,
+  AdditionalRedactedFieldsSchema,
   PROJECT_KEY_SCOPE,
   SpanEvent,
   SpanEventSchema,
@@ -25,6 +26,11 @@ interface ProjectKeyCandidate {
   scopes: string[];
   revoked_at: Date | string | null;
   project_status: string;
+}
+
+interface ProjectPrivacyPolicyCandidate {
+  additional_redacted_fields: unknown;
+  capture_prompt_response: boolean;
 }
 
 export type InvalidBatchReasonCode = 'invalid_request_schema' | 'service_environment_unregistered';
@@ -70,6 +76,22 @@ export class SpanIngestService {
       this.rejectInvalidBatch('service_environment_unregistered', requestTraceId);
     }
 
+    const privacyPolicy = await this.query<ProjectPrivacyPolicyCandidate>(
+      `SELECT additional_redacted_fields, capture_prompt_response
+       FROM project_privacy_policies WHERE project_id = $1`,
+      [candidate.project_id],
+    );
+    const redactedFields = privacyPolicy.rows.length === 1
+      ? AdditionalRedactedFieldsSchema.safeParse(privacyPolicy.rows[0].additional_redacted_fields)
+      : null;
+    if (
+      !redactedFields?.success
+      || privacyPolicy.rows[0].capture_prompt_response !== false
+    ) {
+      // A missing, corrupt, or unsupported policy must never bypass redaction.
+      throw new ServiceUnavailableException('Span ingestion privacy policy is unavailable');
+    }
+
     const lastUsed = await this.query<{ id: string }>(
       `UPDATE project_keys SET last_used_at = now()
        WHERE id = $1 AND revoked_at IS NULL RETURNING id`,
@@ -90,7 +112,7 @@ export class SpanIngestService {
         // Span.error is unstructured free text and may contain prompts, user
         // content, or credentials. Keep status, but never forward that text.
         error: undefined,
-        attributes: redactSpanAttributes(span.attributes),
+        attributes: redactSpanAttributes(span.attributes, redactedFields.data),
         schemaVersion: SPAN_SCHEMA_VERSION,
         projectId: batch.data.projectId,
         environment: batch.data.environment as Environment,

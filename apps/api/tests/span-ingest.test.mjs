@@ -55,6 +55,13 @@ function makeHarness(overrides = {}) {
         const names = overrides.registeredServices ?? ['api'];
         return { rows: names.map((name) => ({ name })), rowCount: names.length };
       }
+      if (sql.includes('FROM project_privacy_policies')) {
+        if (overrides.privacyDatabaseError) throw overrides.privacyDatabaseError;
+        if (overrides.privacyPolicyMissing) return { rows: [], rowCount: 0 };
+        return { rows: [overrides.privacyPolicy ?? {
+          additional_redacted_fields: [], capture_prompt_response: false,
+        }], rowCount: 1 };
+      }
       if (sql.includes('UPDATE project_keys')) {
         return { rows: [{ id: candidate.key_id }], rowCount: 1 };
       }
@@ -177,6 +184,40 @@ test('环境或服务未在该项目注册时拒绝整批 Span', async () => {
   await assertHttpStatus(harness.service.ingest(makeRequest(harness.key)), 400);
   assert.equal(harness.published.length, 0);
   assert.equal(harness.queries.find(({ sql }) => sql.includes('FROM services')).values[1], 'dev');
+});
+
+test('项目隐私策略附加字段会在队列前递归脱敏，策略缺失或开启原文时失败关闭', async (t) => {
+  await t.test('nested object 与 array 均按项目字段策略过滤', async () => {
+    const harness = makeHarness({ privacyPolicy: {
+      additional_redacted_fields: ['customer_email', 'tenant_id'],
+      capture_prompt_response: false,
+    } });
+    const raw = 'private-tenant-value';
+    await harness.service.ingest(makeRequest(harness.key, [makeSpan({
+      attributes: {
+        customer_email: 'private@example.test',
+        nested: { tenant_id: raw, visible: 'kept' },
+        list: [{ customer_email: 'array-private@example.test', visible: true }],
+      },
+    })]));
+    assert.deepEqual(harness.published[0].attributes, { nested: { visible: 'kept' }, list: [{ visible: true }] });
+    assert.doesNotMatch(JSON.stringify(harness.published), /private@example|array-private|private-tenant-value/);
+  });
+
+  await t.test('策略读取失败、缺失、损坏或不支持原文时不入队', async (t2) => {
+    const cases = [
+      ['策略缺失', { privacyPolicyMissing: true }],
+      ['原文开关损坏', { privacyPolicy: { additional_redacted_fields: [], capture_prompt_response: true } }],
+      ['依赖不可用', { privacyDatabaseError: new Error('database secret') }],
+    ];
+    for (const [name, overrides] of cases) {
+      await t2.test(name, async () => {
+        const harness = makeHarness(overrides);
+        await assertHttpStatus(harness.service.ingest(makeRequest(harness.key)), 503);
+        assert.equal(harness.published.length, 0);
+      });
+    }
+  });
 });
 
 test('密钥候选按前缀查询且数据库错误不会泄露底层信息', async () => {

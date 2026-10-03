@@ -1,10 +1,10 @@
 import { Controller, Get, Param, Query, UseGuards } from '@nestjs/common';
-import { AdminTokenGuard } from '../admin/admin-token.guard';
+import { TraceReadGuard } from './trace-read.guard';
 import { TraceListService } from './trace-list.service';
 import { TraceDetailService } from './trace-detail.service';
 
 @Controller('traces')
-@UseGuards(AdminTokenGuard)
+@UseGuards(TraceReadGuard)
 export class TracesController {
   constructor(private readonly listService: TraceListService, private readonly detailService: TraceDetailService) {}
 
