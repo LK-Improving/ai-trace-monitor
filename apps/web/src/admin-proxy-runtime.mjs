@@ -28,6 +28,7 @@ const ADMIN_PATH_PREFIXES = [
   '/api/v1/metrics',
   '/api/v1/traces',
   '/api/v1/alerts',
+  '/api/v1/ops',
 ];
 
 const SAFE_ERRORS = {
@@ -139,6 +140,7 @@ function exactRoute(pathname) {
   if (pathname === '/api/v1/traces') return { name: 'traces', path: pathname };
   if (pathname === '/api/v1/alerts') return { name: 'alerts', path: pathname };
   if (pathname === '/api/v1/alerts/summary') return { name: 'alertSummary', path: pathname };
+  if (pathname === '/api/v1/ops/health') return { name: 'opsHealth', path: pathname };
   if (pathname === '/api/v1/alerts/channels') return { name: 'alertChannels', path: pathname };
   if (pathname === '/api/v1/alerts/deliveries') return { name: 'alertDeliveries', path: pathname };
 
@@ -189,6 +191,7 @@ export function inspectAdminRequestTarget(target) {
 
   const route = exactRoute(pathname);
   if (!route) return { candidate: true, valid: false, reason: 'route' };
+  if (route.name === 'opsHealth' && target.includes('?')) return { candidate: true, valid: false, reason: 'origin-form' };
   return { candidate: true, valid: true, route, rawQuery };
 }
 
@@ -551,6 +554,9 @@ export function validateAdminQuery(route, rawQuery, method) {
   let result = false;
   switch (route.name) {
     case 'projects':
+      result = query.size === 0;
+      break;
+    case 'opsHealth':
       result = query.size === 0;
       break;
     case 'projectServices':

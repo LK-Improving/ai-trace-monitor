@@ -2,11 +2,12 @@ import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { isIP } from 'node:net';
+import { createConnection, isIP } from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ClickHouseLogLevel, createClient } from '@clickhouse/client';
 import { Kafka, logLevel } from 'kafkajs';
+import { Pool } from 'pg';
 import test from 'node:test';
 
 const integrationEnabled = process.env.TRACE_OPS_RUN_INTEGRATION === '1';
@@ -67,6 +68,59 @@ function parseLocalClickHouseUrl(value) {
   return url.toString();
 }
 
+function parseLocalPostgresUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error('DATABASE_URL must be a valid local PostgreSQL URL');
+  }
+
+  if (!['postgres:', 'postgresql:'].includes(url.protocol) || !isLoopback(url.hostname)) {
+    throw new Error('Integration acceptance only allows a loopback PostgreSQL URL');
+  }
+  return value;
+}
+
+async function assertCollectorOpsPortFree() {
+  const occupied = await new Promise((resolve) => {
+    let settled = false;
+    const socket = createConnection({ host: '127.0.0.1', port: 3011 });
+    const finish = (isOccupied) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(isOccupied);
+    };
+    const timer = setTimeout(() => finish(true), 500);
+    socket.once('connect', () => finish(true));
+    socket.once('error', (error) => finish(error.code !== 'ECONNREFUSED'));
+  });
+  if (occupied) {
+    throw new Error('Collector health port 3011 is already in use; refusing to disturb another process');
+  }
+}
+
+async function readIsolatedCollectorHealth(topic, consumerGroup) {
+  try {
+    const response = await fetch('http://127.0.0.1:3011/internal/ops/health', {
+      method: 'GET',
+      cache: 'no-store',
+      signal: AbortSignal.timeout(1_000),
+    });
+    if (!response.ok) return undefined;
+    const value = await response.json();
+    if (value?.topic !== topic || value?.consumerGroup !== consumerGroup) return undefined;
+    if (!Number.isSafeInteger(value.processedMessages) || !Number.isSafeInteger(value.failedBatches)
+      || !Number.isSafeInteger(value.insertedSpans) || !Number.isSafeInteger(value.committedBatches)
+      || !Number.isSafeInteger(value.invalidMessages)) return undefined;
+    return value;
+  } catch {
+    return undefined;
+  }
+}
+
 function quoteIdentifier(identifier) {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(identifier)) {
     throw new Error('CLICKHOUSE_DATABASE must be a simple ClickHouse identifier');
@@ -123,6 +177,7 @@ test('W6B real Kafka → Collector → ClickHouse persistence, retry, and poison
 
   const brokers = parseLocalBrokers(process.env.KAFKA_BROKERS ?? 'localhost:9092');
   const clickhouseUrl = parseLocalClickHouseUrl(process.env.CLICKHOUSE_URL ?? 'http://localhost:8123');
+  const databaseUrl = parseLocalPostgresUrl(process.env.DATABASE_URL ?? '');
   const database = process.env.CLICKHOUSE_DATABASE ?? 'observability';
   const quotedDatabase = quoteIdentifier(database);
   const username = process.env.CLICKHOUSE_USER ?? 'trace_ops';
@@ -135,6 +190,8 @@ test('W6B real Kafka → Collector → ClickHouse persistence, retry, and poison
   const qualifiedTable = `${quotedDatabase}.\`${table}\``;
   const failureCanary = `W6B_FAILURE_CANARY_${randomUUID()}`;
   const poisonCanary = `W6B_POISON_CANARY_${randomUUID()}`;
+  const projectId = randomUUID();
+  const projectSlug = `w6b-${runId}`;
   const canaries = [failureCanary, poisonCanary];
 
   const kafka = new Kafka({
@@ -147,6 +204,8 @@ test('W6B real Kafka → Collector → ClickHouse persistence, retry, and poison
   });
   const admin = kafka.admin();
   const producer = kafka.producer();
+  const postgres = new Pool({ connectionString: databaseUrl, max: 1, connectionTimeoutMillis: requestTimeoutMs });
+  postgres.on('error', () => undefined);
   const clickhouse = createClient({
     url: clickhouseUrl,
     username,
@@ -158,6 +217,7 @@ test('W6B real Kafka → Collector → ClickHouse persistence, retry, and poison
 
   let adminConnected = false;
   let producerConnected = false;
+  let projectCreationAttempted = false;
   let topicCreationMayHaveCompleted = false;
   let tableCreationMayHaveCompleted = false;
   let collectorSpawnFailed = false;
@@ -201,6 +261,23 @@ test('W6B real Kafka → Collector → ClickHouse persistence, retry, and poison
   };
 
   try {
+    // This test's child owns the Collector's fixed loopback health port. Do
+    // not create Kafka/Postgres/ClickHouse fixtures if another process uses it.
+    await assertCollectorOpsPortFree();
+
+    const existingProject = await postgres.query(
+      'SELECT id FROM projects WHERE id = $1 OR slug = $2 LIMIT 1',
+      [projectId, projectSlug],
+    );
+    if (existingProject.rows.length > 0) {
+      throw new Error('A randomly generated W6B PostgreSQL project already exists; refusing to reuse it');
+    }
+    projectCreationAttempted = true;
+    await postgres.query(
+      'INSERT INTO projects (id, name, slug) VALUES ($1, $2, $3)',
+      [projectId, `W6B integration ${runId.slice(0, 8)}`, projectSlug],
+    );
+
     await admin.connect();
     adminConnected = true;
 
@@ -226,7 +303,6 @@ test('W6B real Kafka → Collector → ClickHouse persistence, retry, and poison
     await producer.connect();
     producerConnected = true;
 
-    const projectId = randomUUID();
     const baseTime = Date.now();
     const expectedSpans = Array.from({ length: 3 }, (_, index) => ({
       schemaVersion: 1,
@@ -284,9 +360,17 @@ test('W6B real Kafka → Collector → ClickHouse persistence, retry, and poison
       output.includes(`Collector subscribed to ${topic}; ClickHouse table: ${table}`)
     ), { timeoutMs: 15_000, child: collector, childSpawnFailed: () => collectorSpawnFailed });
 
-    await waitFor('the expected ClickHouse write failure', () => (
-      output.includes('ClickHouse batch insert failed')
-    ), { timeoutMs: 20_000, child: collector, childSpawnFailed: () => collectorSpawnFailed });
+    let failedAttempt;
+    await waitFor('the isolated Collector to classify the unavailable target as a failed batch', async () => {
+      failedAttempt = await readIsolatedCollectorHealth(topic, groupId);
+      return failedAttempt !== undefined
+        && failedAttempt.processedMessages >= expectedSpans.length
+        && failedAttempt.failedBatches >= 1;
+    }, { timeoutMs: 20_000, child: collector, childSpawnFailed: () => collectorSpawnFailed });
+    assert.equal(failedAttempt.status, 'degraded');
+    assert.equal(failedAttempt.insertedSpans, 0);
+    assert.equal(failedAttempt.committedBatches, 0);
+    assert.equal(failedAttempt.lastCommitAt, null);
     if (canaryLeaked) throw new Error('Collector failure logs unexpectedly contained synthetic canary data');
 
     const failedOffset = await readCommittedOffset();
@@ -305,6 +389,17 @@ test('W6B real Kafka → Collector → ClickHouse persistence, retry, and poison
       const [row] = await result.json();
       return Number(row?.count ?? 0) === expectedSpans.length;
     }, { timeoutMs: waitTimeoutMs, child: collector, childSpawnFailed: () => collectorSpawnFailed });
+
+    let recoveredAttempt;
+    await waitFor('Collector success counters and the committed offset to recover', async () => {
+      recoveredAttempt = await readIsolatedCollectorHealth(topic, groupId);
+      return recoveredAttempt !== undefined
+        && recoveredAttempt.failedBatches >= 1
+        && recoveredAttempt.insertedSpans === expectedSpans.length
+        && recoveredAttempt.committedBatches >= 1
+        && recoveredAttempt.lastCommitAt !== null;
+    }, { timeoutMs: waitTimeoutMs, child: collector, childSpawnFailed: () => collectorSpawnFailed });
+    assert.equal(recoveredAttempt.status, 'running');
 
     const insertedResult = await clickhouse.query({
       query: `SELECT span_id, error, attributes, total_tokens FROM ${qualifiedTable} ORDER BY span_id`,
@@ -344,6 +439,13 @@ test('W6B real Kafka → Collector → ClickHouse persistence, retry, and poison
     await waitFor('the poison-message offset to advance to 4', async () => (
       await readCommittedOffset() === 4n
     ), { timeoutMs: waitTimeoutMs, child: collector, childSpawnFailed: () => collectorSpawnFailed });
+    let poisonSnapshot;
+    await waitFor('health counters to reflect poison-message classification and commit', async () => {
+      poisonSnapshot = await readIsolatedCollectorHealth(topic, groupId);
+      return poisonSnapshot !== undefined
+        && poisonSnapshot.invalidMessages === 1
+        && poisonSnapshot.committedBatches >= 2;
+    }, { timeoutMs: waitTimeoutMs, child: collector, childSpawnFailed: () => collectorSpawnFailed });
 
     if (canaryLeaked) throw new Error('Collector logs unexpectedly contained synthetic canary data');
     assert.equal(await tableExists(), true, 'The target table should exist only after explicit recovery');
@@ -431,15 +533,26 @@ test('W6B real Kafka → Collector → ClickHouse persistence, retry, and poison
 
     if (adminConnected) await attemptCleanup('Kafka admin disconnect', () => admin.disconnect());
     await attemptCleanup('ClickHouse client close', () => clickhouse.close());
+    if (projectCreationAttempted) {
+      await attemptCleanup('temporary PostgreSQL project and alert cleanup', async () => {
+        await postgres.query('DELETE FROM projects WHERE id = $1 AND slug = $2', [projectId, projectSlug]);
+        const remaining = await postgres.query(
+          'SELECT id FROM projects WHERE id = $1 AND slug = $2 LIMIT 1',
+          [projectId, projectSlug],
+        );
+        if (remaining.rows.length !== 0) throw new Error('Temporary W6B project cleanup verification failed');
+      });
+    }
+    await attemptCleanup('PostgreSQL pool close', () => postgres.end());
 
     if (cleanupFailures.length > 0) {
       const failureSummary = primaryFailure
-        ? ` Original acceptance failure: ${summarizeFailure(primaryFailure, [...canaries, password, clickhouseUrl])}.`
+        ? ` Original acceptance failure: ${summarizeFailure(primaryFailure, [...canaries, password, clickhouseUrl, databaseUrl])}.`
         : '';
       const message = `W6B integration cleanup failed for: ${cleanupFailures.join(', ')}.${failureSummary}`;
       throw new Error(message);
     }
   }
 
-  if (primaryFailure) throw new Error(summarizeFailure(primaryFailure, [...canaries, password, clickhouseUrl]));
+  if (primaryFailure) throw new Error(summarizeFailure(primaryFailure, [...canaries, password, clickhouseUrl, databaseUrl]));
 });

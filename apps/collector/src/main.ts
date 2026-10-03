@@ -8,6 +8,12 @@ import {
   runWithHeartbeat,
 } from './clickhouse-sink';
 import { AlertEngine } from './alert-engine';
+import {
+  CollectorTelemetry,
+  observeBatchAttempt,
+  observeClickHouseWrite,
+} from './collector-telemetry';
+import { createOpsHealthServer, listenOpsHealthServer } from './ops-health';
 
 const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',').map((broker) => broker.trim());
 const topic = process.env.KAFKA_TOPIC ?? 'ai-spans';
@@ -35,6 +41,16 @@ const alertEngine = new AlertEngine(new Pool({
   max: 5,
   connectionTimeoutMillis: 5_000,
 }));
+const telemetry = new CollectorTelemetry(topic, groupId);
+const opsHealthServer = createOpsHealthServer(telemetry);
+consumer.on(consumer.events.GROUP_JOIN, () => telemetry.markRunning());
+consumer.on(consumer.events.CRASH, () => telemetry.markDegraded());
+consumer.on(consumer.events.DISCONNECT, () => telemetry.markDegraded());
+opsHealthServer.once('error', () => {
+  // Listener failures are operationally useful, but provider error details are not safe to log.
+  console.error('Collector internal health endpoint could not start');
+});
+listenOpsHealthServer(opsHealthServer);
 
 let stopping = false;
 let clickhouseDeduplicationReady = false;
@@ -105,7 +121,6 @@ async function bootstrap(): Promise<void> {
     eachBatchAutoResolve: false,
     eachBatch: async ({ batch, resolveOffset, heartbeat, isRunning, isStale }) => {
       if (!isActive(isRunning, isStale)) return;
-      await heartbeat();
 
       const invalidCounts: Record<InvalidReason, number> = {
         empty_payload: 0,
@@ -115,43 +130,52 @@ async function bootstrap(): Promise<void> {
       const messages: CollectorMessage[] = batch.messages.map(({ offset, value }) => ({ offset, value }));
 
       try {
-        await processSpanBatch(messages, {
-          source: { topic: batch.topic, partition: batch.partition },
-          insert: async (rows, deduplicationToken) => {
-            if (!await ensureClickHouseDeduplication()) {
-              throw new Error('ClickHouse target table is not ready');
-            }
-            await insertWithHeartbeat(rows, {
-              insert: async (batchRows) => clickhouse.insert({
-                table,
-                values: batchRows,
-                format: 'JSONEachRow',
-                clickhouse_settings: { insert_deduplication_token: deduplicationToken },
-              }),
-              heartbeat,
-              canContinue: () => isActive(isRunning, isStale),
-            });
-          },
-          processAlerts: async (spans) => {
-            await runWithHeartbeat(() => alertEngine.processSpans(spans), {
-              heartbeat,
-              canContinue: () => isActive(isRunning, isStale),
-              operationName: 'Alert persistence',
-            });
-          },
-          commit: async (lastProcessedOffset, nextOffset) => {
-            if (!isActive(isRunning, isStale)) return;
+        await observeBatchAttempt(telemetry, messages.length, async () => {
+          await heartbeat();
+          await processSpanBatch(messages, {
+            source: { topic: batch.topic, partition: batch.partition },
+            insert: async (rows, deduplicationToken) => {
+              if (!await ensureClickHouseDeduplication()) {
+                throw new Error('ClickHouse target table is not ready');
+              }
+              await insertWithHeartbeat(rows, {
+                insert: async (batchRows) => observeClickHouseWrite(
+                  telemetry,
+                  batchRows.length,
+                  () => clickhouse.insert({
+                    table,
+                    values: batchRows,
+                    format: 'JSONEachRow',
+                    clickhouse_settings: { insert_deduplication_token: deduplicationToken },
+                  }),
+                ),
+                heartbeat,
+                canContinue: () => isActive(isRunning, isStale),
+              });
+            },
+            processAlerts: async (spans) => {
+              await runWithHeartbeat(() => alertEngine.processSpans(spans), {
+                heartbeat,
+                canContinue: () => isActive(isRunning, isStale),
+                operationName: 'Alert persistence',
+              });
+            },
+            commit: async (lastProcessedOffset, nextOffset) => {
+              if (!isActive(isRunning, isStale)) return;
 
-            await consumer.commitOffsets([{
-              topic: batch.topic,
-              partition: batch.partition,
-              offset: nextOffset,
-            }]);
-            resolveOffset(lastProcessedOffset);
-          },
-          onInvalid: (reason) => {
-            invalidCounts[reason] += 1;
-          },
+              await consumer.commitOffsets([{
+                topic: batch.topic,
+                partition: batch.partition,
+                offset: nextOffset,
+              }]);
+              telemetry.recordCommitSuccess();
+              resolveOffset(lastProcessedOffset);
+            },
+            onInvalid: (reason) => {
+              invalidCounts[reason] += 1;
+              telemetry.recordInvalidMessage();
+            },
+          });
         });
       } finally {
         logInvalidBatch(invalidCounts, batch.topic, batch.partition);
@@ -163,6 +187,7 @@ async function bootstrap(): Promise<void> {
 async function closeResources(): Promise<void> {
   if (closePromise) return closePromise;
   stopping = true;
+  telemetry.markUnavailable();
 
   closePromise = (async () => {
     if (startupOperation) await startupOperation.catch(() => undefined);
@@ -178,6 +203,7 @@ async function closeResources(): Promise<void> {
       consumer.disconnect(),
       clickhouse.close(),
       alertEngine.close(),
+      closeOpsHealthServer(),
     ]);
     if (results.some((result) => result.status === 'rejected')) {
       console.error('Collector encountered a resource cleanup failure');
@@ -186,6 +212,14 @@ async function closeResources(): Promise<void> {
   })();
 
   return closePromise;
+}
+
+async function closeOpsHealthServer(): Promise<void> {
+  if (!opsHealthServer.listening) return;
+  opsHealthServer.closeAllConnections();
+  await new Promise<void>((resolve) => {
+    opsHealthServer.close(() => resolve());
+  });
 }
 
 async function shutdown(signal: string): Promise<void> {
@@ -205,6 +239,7 @@ process.once('SIGTERM', () => {
 });
 
 void bootstrap().catch(async () => {
+  telemetry.markUnavailable();
   console.error('Collector stopped after an unrecoverable startup or runtime failure');
   process.exitCode = 1;
   await closeResources();

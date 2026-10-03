@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 
-export type IconName = 'overview' | 'traces' | 'ai' | 'alerts' | 'settings' | 'docs' | 'external' | 'chevron' | 'arrow' | 'copy' | 'search' | 'download' | 'plus' | 'check' | 'close' | 'clock' | 'filter';
+export type IconName = 'overview' | 'traces' | 'ai' | 'alerts' | 'settings' | 'operations' | 'docs' | 'external' | 'chevron' | 'arrow' | 'copy' | 'search' | 'download' | 'plus' | 'check' | 'close' | 'clock' | 'filter';
 
 const iconPaths: Record<IconName, ReactNode> = {
   overview: <><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" /></>,
@@ -8,6 +8,7 @@ const iconPaths: Record<IconName, ReactNode> = {
   ai: <><path d="M4 7h6M14 7h6M7 4v6M17 4v6M7 14v6M17 14v6M4 17h6M14 17h6" /><circle cx="12" cy="12" r="2" /></>,
   alerts: <><path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" /></>,
   settings: <><circle cx="12" cy="12" r="3" /><path d="m19 13 2 1-2 4-2-1a8 8 0 0 1-2 1l-.5 2h-4L10 18a8 8 0 0 1-2-1l-2 1-2-4 2-1v-2l-2-1 2-4 2 1a8 8 0 0 1 2-1l.5-2h4L15 6a8 8 0 0 1 2 1l2-1 2 4-2 1z" transform="translate(-1 -1)" /></>,
+  operations: <><path d="M3 17h4l3-6 4 3 3-7 4 2" /><path d="M3 21h18" /><circle cx="17" cy="7" r="1" /></>,
   docs: <><path d="M5 3.5h9l5 5V20a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V4.5a1 1 0 0 1 1-1Z" /><path d="M14 4v5h5M8 13h8M8 17h8" /></>,
   external: <><path d="M14 4h6v6M20 4l-9 9" /><path d="M18 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6" /></>,
   chevron: <path d="m7 10 5 5 5-5" />,

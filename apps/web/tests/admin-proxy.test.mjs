@@ -172,6 +172,7 @@ test('accepts only exact admin route shapes in origin-form', () => {
     '/api/v1/traces/trace_v1_abc-123',
     '/api/v1/alerts',
     '/api/v1/alerts/summary',
+    '/api/v1/ops/health',
     `/api/v1/alerts/${projectId}/state`,
     `/api/v1/projects/${projectId}/services`,
     `/api/v1/projects/${projectId}/privacy`,
@@ -195,6 +196,8 @@ test('accepts only exact admin route shapes in origin-form', () => {
     `/api/v1/alerts/${projectId}/state/extra`,
     '/api/v1/alerts/not-a-uuid/state',
     '/api/v1/alerts/summary/export',
+    '/api/v1/ops/health/extra',
+    '/api/v1/ops/health?',
     '/api/v1/%70rojects',
     '/api/v1/projects\\..\\traces',
     '//outside.example/api/v1/projects',
@@ -218,6 +221,14 @@ test('accepts only exact admin route shapes in origin-form', () => {
     '/favicon.svg',
   ];
   for (const path of viteStaticTargets) assert.equal(inspectAdminRequestTarget(path), undefined, path);
+});
+
+test('platform health route allows only an empty query string', () => {
+  const route = routeFor('/api/v1/ops/health');
+  assert.equal(validateAdminQuery(route, '', 'GET').valid, true);
+  assert.equal(validateAdminQuery(route, `projectId=${projectId}`, 'GET').valid, false);
+  assert.equal(validateAdminQuery(route, 'environment=prod', 'GET').valid, false);
+  assert.equal(validateAdminQuery(route, 'range=24h', 'GET').valid, false);
 });
 
 test('project settings query and request bodies allow only the agreed DTO fields', () => {
@@ -523,6 +534,7 @@ test('middleware forwards only validated allowlisted GETs with the server token'
   const beforeCount = upstreamRequests.length;
   const cases = [
     ['/api/v1/projects', '/api/v1/projects'],
+    ['/api/v1/ops/health', '/api/v1/ops/health'],
     [`/api/v1/overview?projectId=${projectId}&environment=staging&range=24h`, `/api/v1/overview?projectId=${projectId}&environment=staging&range=24h`],
     [`/api/v1/metrics/overview?projectId=${projectId}&groupBy=service`, `/api/v1/metrics/overview?projectId=${projectId}&groupBy=service`],
     [`/api/v1/metrics/ai?projectId=${projectId}&service=api`, `/api/v1/metrics/ai?projectId=${projectId}&service=api`],
@@ -551,6 +563,25 @@ test('middleware forwards only validated allowlisted GETs with the server token'
     assert.equal(request.body, '');
   }
   for (let index = 0; index < cases.length; index++) assert.equal(forwarded[index].url, cases[index][1]);
+});
+
+test('platform operations proxy rejects filters, bodies, and non-GET methods before forwarding', async () => {
+  const beforeCount = upstreamRequests.length;
+  const withProject = await get(`/api/v1/ops/health?projectId=${projectId}`, { headers: localHeaders() });
+  assert.equal(withProject.status, 400);
+  const emptyQuery = await get('/api/v1/ops/health?', { headers: localHeaders() });
+  assert.equal(emptyQuery.status, 400);
+  const withEnvironment = await get('/api/v1/ops/health?environment=prod', { headers: localHeaders() });
+  assert.equal(withEnvironment.status, 400);
+  const withBody = await get('/api/v1/ops/health', {
+    headers: { ...localHeaders(), 'content-length': '2' },
+    body: '{}',
+  });
+  assert.equal(withBody.status, 400);
+  const mutation = await get('/api/v1/ops/health', { method: 'POST', headers: localHeaders() });
+  assert.equal(mutation.status, 405);
+  assert.equal(mutation.headers.allow, 'GET');
+  assert.equal(upstreamRequests.length, beforeCount);
 });
 
 test('middleware forwards only the exact same-origin alert state PATCH with a normalized allowlisted body', async () => {

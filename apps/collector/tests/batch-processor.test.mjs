@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const { createClickHouseDeduplicationToken, processSpanBatch } = require('../dist/batch-processor.js');
+const { CollectorTelemetry, observeBatchAttempt, observeClickHouseWrite } = require('../dist/collector-telemetry.js');
 
 const projectId = 'b35a64bb-8a12-4806-9e77-8831870a5dd0';
 const processBatch = (messages, options) => processSpanBatch(messages, {
@@ -87,6 +88,52 @@ test('ClickHouse insert 失败时保留 Kafka offset，供失败重试或重新�
 
   assert.equal(insertCalls, 1);
   assert.equal(commitCalls, 0, 'An unsuccessful persistence attempt must never advance the offset');
+});
+
+test('Collector telemetry follows real batch processing and counts Kafka redelivery as a new attempt', async () => {
+  const telemetry = new CollectorTelemetry('batch-processor-test', 'batch-processor-group');
+  telemetry.markRunning();
+  const deliveredMessages = [
+    message('41', JSON.stringify(makeSpan())),
+    message('42', null),
+  ];
+  const privateError = new Error('private ClickHouse response canary');
+  let insertAttempts = 0;
+  let committedOffsets = 0;
+
+  const deliver = () => observeBatchAttempt(telemetry, deliveredMessages.length, () => processBatch(deliveredMessages, {
+    async insert(rows) {
+      await observeClickHouseWrite(telemetry, rows.length, async () => {
+        insertAttempts += 1;
+        if (insertAttempts === 1) throw privateError;
+      });
+    },
+    async commit() {
+      committedOffsets += 1;
+      telemetry.recordCommitSuccess();
+    },
+    onInvalid() { telemetry.recordInvalidMessage(); },
+  }));
+
+  await assert.rejects(deliver(), (error) => error === privateError);
+  await deliver();
+
+  assert.equal(committedOffsets, 1, 'The failed insert must not commit; its successful redelivery commits once');
+  assert.deepEqual(telemetry.snapshot(), {
+    status: 'running',
+    topic: 'batch-processor-test',
+    consumerGroup: 'batch-processor-group',
+    uptimeSeconds: telemetry.snapshot().uptimeSeconds,
+    processedMessages: 4,
+    insertedSpans: 1,
+    invalidMessages: 2,
+    failedBatches: 1,
+    clickhouseWriteFailures: 1,
+    committedBatches: 1,
+    lastCommitAt: telemetry.snapshot().lastCommitAt,
+    lastClickHouseWriteAt: telemetry.snapshot().lastClickHouseWriteAt,
+  });
+  assert.equal(JSON.stringify(telemetry.snapshot()).includes('private ClickHouse'), false);
 });
 
 test('无效 payload 只产生固定安全原因码，不向日志或回调泄露原文', async () => {

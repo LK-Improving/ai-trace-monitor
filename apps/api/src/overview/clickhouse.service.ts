@@ -1,12 +1,15 @@
 import { Injectable, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ClickHouseLogLevel, createClient } from '@clickhouse/client';
+import { performance } from 'node:perf_hooks';
+import { QueryLatencySnapshot, QueryLatencyWindow } from './query-latency-window';
 
 export type ClickHouseQueryParams = Record<string, string | number>;
 
 @Injectable()
 export class ClickHouseService implements OnModuleDestroy {
   private readonly client: ReturnType<typeof createClient>;
+  private readonly latencyWindow = new QueryLatencyWindow();
 
   constructor(config: ConfigService) {
     this.client = createClient({
@@ -24,6 +27,7 @@ export class ClickHouseService implements OnModuleDestroy {
     query: string,
     queryParams: ClickHouseQueryParams,
   ): Promise<Row[]> {
+    const startedAt = performance.now();
     try {
       const result = await this.client.query({
         query,
@@ -40,10 +44,30 @@ export class ClickHouseService implements OnModuleDestroy {
           result_overflow_mode: 'throw',
         },
       });
-      return await result.json<Row>();
+      const rows = await result.json<Row>();
+      this.latencyWindow.record(performance.now() - startedAt, false);
+      return rows;
     } catch {
+      this.latencyWindow.record(performance.now() - startedAt, true);
       // Do not retain or forward ClickHouse's error: it can contain SQL details.
       throw new Error('Analytics query failed');
+    }
+  }
+
+  queryLatencySnapshot(): QueryLatencySnapshot {
+    return this.latencyWindow.snapshot();
+  }
+
+  async ping(timeoutMs = 1_200): Promise<boolean> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const result = await this.client.ping({ select: true, abort_signal: controller.signal });
+      return result.success;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timer);
     }
   }
 

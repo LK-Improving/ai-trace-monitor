@@ -13,8 +13,9 @@ import {
 import { createTimeWindow, createTimeWindowAround, fetchTraceList, type TraceListResponse } from './chain-api';
 import { AiChainPage, TraceDetail, TraceExplorer, type TraceSelection } from './pages/LivePages';
 import { AlertsPage, DocsPage, OverviewPage, SettingsPage } from './pages/Pages';
+import { PlatformOperationsPage } from './pages/PlatformOperationsPage';
 
-type PageName = 'overview' | 'traces' | 'ai' | 'alerts' | 'settings' | 'docs';
+type PageName = 'overview' | 'traces' | 'ai' | 'alerts' | 'settings' | 'operations' | 'docs';
 type ProjectState =
   | { status: 'loading' }
   | { status: 'ready'; projects: ProjectOption[] }
@@ -31,6 +32,7 @@ const navigation: { id: PageName; label: string; icon: IconName }[] = [
   { id: 'ai', label: 'AI 链路', icon: 'ai' },
   { id: 'alerts', label: '告警中心', icon: 'alerts' },
   { id: 'settings', label: '项目设置', icon: 'settings' },
+  { id: 'operations', label: '平台运维', icon: 'operations' },
   { id: 'docs', label: '接入文档', icon: 'docs' },
 ];
 
@@ -40,6 +42,7 @@ const pageTitles: Record<PageName, string> = {
   ai: 'AI 链路',
   alerts: '告警中心',
   settings: '项目设置',
+  operations: '平台运维',
   docs: '接入文档',
 };
 
@@ -55,7 +58,7 @@ function formatGeneratedAt(value: string): string {
 }
 
 function isApiPage(page: PageName): boolean {
-  return page === 'overview' || page === 'traces' || page === 'ai' || page === 'alerts';
+  return page === 'overview' || page === 'traces' || page === 'ai' || page === 'alerts' || page === 'operations';
 }
 
 function ProjectGate({ state, onRetry }: { state: ProjectState; onRetry: () => void }) {
@@ -205,9 +208,11 @@ export default function App() {
   return <div className="app-shell">
     <aside className="sidebar">
       <button className="brand" type="button" onClick={() => navigate('overview')} aria-label="Trace Ops 首页">TRACE <span>OPS</span></button>
-      <div className="project-switcher" aria-label="当前项目">
-        <span><strong>{selectedProject?.name ?? projectPlaceholder}</strong><small>{selectedProject?.slug ?? '项目 · API 管理'}</small></span>
-        <Icon name="chevron" size={15} />
+      <div className="project-switcher" aria-label={page === 'operations' ? '当前平台范围' : '当前项目'}>
+        <span>{page === 'operations'
+          ? <><strong>平台基础设施</strong><small>全局视图 · 不按项目筛选</small></>
+          : <><strong>{selectedProject?.name ?? projectPlaceholder}</strong><small>{selectedProject?.slug ?? '项目 · API 管理'}</small></>}</span>
+        {page !== 'operations' && <Icon name="chevron" size={15} />}
       </div>
       <nav className="main-nav" aria-label="主导航">
         {navigation.slice(0, 4).map((item) => <button key={item.id} type="button" className={`nav-item ${page === item.id ? 'active' : ''}`} onClick={() => navigate(item.id)} aria-label={item.label} title={item.label} aria-current={page === item.id ? 'page' : undefined}><Icon name={item.icon} /><span>{item.label}</span></button>)}
@@ -218,8 +223,8 @@ export default function App() {
     </aside>
 
     <main className="main-content">
-      <header className="topbar"><div className="breadcrumb"><span>{selectedProject?.name ?? 'Trace Ops'}</span><i>/</i><strong>{pageTitles[page]}</strong></div><div className="top-actions"><span className={`demo-label ${page === 'overview' && sourceLabel === 'API 数据' ? 'api-data-label' : ''} ${page !== 'overview' && currentPageUsesApi ? 'api-query-label' : ''} ${sourceLabel === 'API 暂不可用' ? 'source-error' : ''}`}><i />{sourceLabel}</span><button type="button" onClick={() => notify('Trace Ops · AI 全链路监控')}>关于</button><button type="button" onClick={() => navigate('docs')}>文档 <Icon name="external" size={13} /></button><span className="avatar" aria-label="用户 Z">Z</span></div></header>
-      <div className="global-context-bar">
+      <header className="topbar"><div className="breadcrumb"><span>{page === 'operations' ? 'Trace Ops' : selectedProject?.name ?? 'Trace Ops'}</span><i>/</i><strong>{pageTitles[page]}</strong></div><div className="top-actions"><span className={`demo-label ${page === 'overview' && sourceLabel === 'API 数据' ? 'api-data-label' : ''} ${page !== 'overview' && currentPageUsesApi ? 'api-query-label' : ''} ${sourceLabel === 'API 暂不可用' ? 'source-error' : ''}`}><i />{sourceLabel}</span><button type="button" onClick={() => notify('Trace Ops · AI 全链路监控')}>关于</button><button type="button" onClick={() => navigate('docs')}>文档 <Icon name="external" size={13} /></button><span className="avatar" aria-label="用户 Z">Z</span></div></header>
+      {page !== 'operations' && <div className="global-context-bar">
         <div className="project-context"><span className="context-caption">项目</span><strong>{selectedProject?.name ?? projectPlaceholder}</strong><span className="context-separator">/</span><span className="context-caption">全链路运行数据</span></div>
         <div className="global-filters">
           <div className="project-filter">
@@ -232,8 +237,9 @@ export default function App() {
           <label className="context-select"><span>环境</span><select value={environment} onChange={(event) => changeEnvironment(event.target.value as OverviewEnvironment)} aria-label="选择环境"><option value="prod">production</option><option value="staging">staging</option><option value="dev">development</option><option value="all">全部环境</option></select><Icon name="chevron" size={13} /></label>
           <label className="context-select"><span>时间范围</span><select value={timeRange} onChange={(event) => changeRange(event.target.value as OverviewRange)} aria-label="选择时间范围"><option value="1h">最近 1 小时</option><option value="24h">最近 24 小时</option><option value="7d">最近 7 天</option></select><Icon name="chevron" size={13} /></label>
         </div>
-      </div>
+      </div>}
       <div className="page-root">
+        {page === 'operations' && <PlatformOperationsPage />}
         {page === 'overview' && <><section className="page-heading"><div><span className="page-eyebrow">OBSERVABILITY / OVERVIEW</span><h1>运行概况</h1><p>按项目、环境与时间范围查看 AI 应用的真实运行数据。</p></div><span className="last-updated"><Icon name="clock" size={14} />{updatedLabel}</span></section><OverviewPage
           status={overviewPageStatus}
           errorMessage={overviewError}
@@ -270,7 +276,7 @@ export default function App() {
           ? <ProjectGate state={projectState} onRetry={retryProjects} />
           : <SettingsPage projectId={selectedProject.id} projectName={selectedProject.name} environment={environment} onNotify={notify} onDataSourceChange={setSettingsUsesApi} />)}
         {page === 'docs' && <DocsPage onNotify={notify} />}
-        <footer className="page-footer"><span>TRACE OPS <i>·</i> AI 全链路监控</span><span>{getRangeLabel(timeRange)} <i>·</i> {currentPageUsesApi ? '接口数据' : '演示数据'}</span></footer>
+        <footer className="page-footer"><span>TRACE OPS <i>·</i> AI 全链路监控</span><span>{page === 'operations' ? '平台级检查 · API 数据' : `${getRangeLabel(timeRange)} · ${currentPageUsesApi ? '接口数据' : '演示数据'}`}</span></footer>
       </div>
     </main>
     {toast && <div className="toast-message" role="status"><span className="toast-check"><Icon name="check" size={14} /></span>{toast}</div>}

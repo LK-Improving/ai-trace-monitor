@@ -84,7 +84,7 @@ G3 需单独验收真实 Web 性能/异常事件入库与后端 Trace 的联合�
 | W21–W24 | 实现 Alert Engine 内置规则：Span error、延迟、Token 用量阈值、RAG 空召回；告警去重和状态流转 | 已完成并通过本地端到端验收；详见 [W21–W24 内置告警与处理闭环验收](./W21-W24-内置告警与处理闭环验收.md)。Token 阈值仅作使用量告警，不代表货币成本核算；可编辑规则阈值/窗口仍为 P1 增强 |
 | W24–W27 | 实现首批告警通知渠道（Webhook / 邮件优先）；通知失败可重试并可观测，不影响 Span 入库 | 告警中心真实 API、状态处理与 Trace 跳转已在 W21–W24 完成；本阶段聚焦通知渠道、重试和投递观测 |
 | W26–W29 | 补齐项目隔离、角色最小权限、敏感字段策略、关键配置审计和服务接入配置 | 项目 API 凭证单一 scope、跨项目读取拒绝、密钥生命周期、隐私策略、审计和服务配置已实现并验收；成员登录与角色 RBAC 暂未实现，需先确定身份源 |
-| W28–W30 | 平台自身健康与容量指标：Kafka lag、Collector 消费/写入失败、丢弃数、ClickHouse 查询耗时；压测与故障演练 | Kafka / ClickHouse 短时故障不拖垮业务；恢复后可继续消费；性能结果和容量基线归档 |
+| W28–W30 | 平台自身健康与容量指标：Kafka lag、Collector 消费/写入失败、丢弃数、ClickHouse 查询耗时；压测与故障演练 | 本地健康控制台、Kafka 不可达与 ClickHouse 失败恢复演练、只读 API 压力基线已通过；不代表生产 HA/容量认证，详见 [W28–W30 验收](./W28-W30-平台健康与容量验收.md) |
 | W30–W32 | Staging 试点、用户验收、修复阻断问题、回滚演练和上线清单 | **阶段门 G3 / MVP**：需求文档 P0 验收项通过，项目方确认试点数据边界与上线观察人 |
 
 ### Phase 4：AI 根因分析与智能运维（第 32 周后，持续）
@@ -229,3 +229,13 @@ W8 的本地 G1 功能闭环已通过真实验收：浏览器 SDK → API → Ka
 W26–W29 所列“角色最小权限”仅完成凭证 scope 与项目边界，未完成用户/成员 RBAC：当前仓库没有登录/身份提供方，审计 actor 仍为 `platform_admin`，现存成员数据也未作为授权源。需确定身份模型后再补齐 owner/admin/developer/viewer 等角色，不能将机器密钥权限等同于成员角色控制。
 
 API 179 项测试通过（2 项可选集成测试跳过），项目管理专项 10/10、Web 87/87、Contracts 10/10；API/Web typecheck 与 Web 生产构建通过。PostgreSQL 迁移集成 1/1 通过；安全验收脚本覆盖两项目隔离、读写 scope、密钥轮换/撤销、Kafka/ClickHouse 脱敏与审计数据最小化；Playwright 实际操作服务配置、隐私字段、凭证生命周期和审计列表。测试项目已清理；追加式审计数据按设计保留为脱离项目的非敏感元数据。完整记录见 [W26–W29-项目隔离与隐私审计验收](./W26-W29-项目隔离与隐私审计验收.md)。
+
+### Phase 3 W28–W30（2026-10-03）
+
+平台运维页与受管理员保护的 `/api/v1/ops/health` 已接通：展示 PostgreSQL、Kafka 分区 lag、Collector 消费/写入与失败计数、API Span 队列（Span 数与字节双容量）、ClickHouse ping 和进程内滚动 5 分钟查询延迟。Collector 只在 `127.0.0.1:3011` 提供最小内部健康快照；探测失败使用 `unavailable` / `null`，不向响应透出凭证、SQL、原始错误或 Span 内容。Collector/API 计数和 ClickHouse 查询窗口均为进程内数据，重启会清零；不能当作持久化监控或多副本集群总量。
+
+主代理独立复核 API 鉴权和 DTO 白名单、Kafka offset 边界、Collector 计数位置、ClickHouse 查询计时、代理路由限制及窄屏页面。API 194 项通过（2 项可选集成测试跳过），Collector 25 项通过（1 项既有可选集成测试跳过），Web 96 项通过；三端类型检查、Collector/Web 构建及验收脚本语法检查通过。W6B Kafka→Collector→ClickHouse 实际故障演练 1/1 通过：ClickHouse 目标不可用时不提交 Kafka offset；目标恢复后数据写入且 offset 前进；毒性消息被计数并安全前进。
+
+本地管理员健康 API 未授权为 401。40 次/并发 4 的 p50/p95/max 为 31.8/64.2/67.5 ms；200 次/并发 20 的 p50/p95/max 为 100.1/167.6/224.4 ms，全部请求返回且探测结束时 PostgreSQL、Kafka、Collector、ClickHouse 均健康、Kafka lag 为 0。另以独立 API 进程连接不可达的 loopback Kafka 验证：Span 上报在 17 ms 返回 best-effort 202，队列满时正确拒绝；Kafka 发布失败后有界丢弃、错误计数增加，API 进程保持可用，临时项目和密钥清理通过。Playwright 实测运维页刷新及依赖指标显示；1440px 与 390px 视口均无横向溢出，首次查询无控制台错误。
+
+以上是单机本地、小样本验收，不构成生产吞吐容量、长时间稳定性、Kafka/ClickHouse 高可用或多副本指标聚合保证；best-effort Kafka 故障时允许 Span 丢弃，持久化缓冲不在本阶段范围。当前 ClickHouse 查询样本数为 0 时页面如实显示“未知”，不伪造分位值。`pnpm dev` 启动期间曾出现 Node `TimeoutNegativeWarning`，但 Collector 成功订阅且全链路健康探测通过；该警告根因未在本轮定位。完整记录见 [W28–W30-平台健康与容量验收](./W28-W30-平台健康与容量验收.md)。
