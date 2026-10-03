@@ -1,9 +1,22 @@
-import { useState } from 'react';
-import { mockAlerts, mockServices, type AlertLevel, type AlertState } from '../mock/data';
+import { useEffect, useRef, useState } from 'react';
+import { mockServices } from '../mock/data';
 import { Icon, PageIntro, PanelHeading, StatusPill } from '../components/ui';
 import type { OverviewEnvironment, OverviewRange, OverviewResponse, OverviewService, OverviewSeriesPoint } from '../overview-api';
 import type { TraceListResponse, TraceEnvironment, TimeWindow } from '../chain-api';
 import { getQuickstartSnippet } from '../quickstart';
+import {
+  AlertApiError,
+  fetchAlerts,
+  fetchAlertSummary,
+  updateAlertState,
+  type AlertItem,
+  type AlertLevel,
+  type AlertLevelFilter,
+  type AlertListResponse,
+  type AlertState,
+  type AlertStateFilter,
+  type AlertSummary,
+} from '../alerts-api';
 
 function MetricCard({ label, value, detail, tone = 'blue', trend }: { label: string; value: string; detail: string; tone?: 'blue' | 'orange' | 'green'; trend?: string }) {
   return <article className="metric-card"><div className="metric-topline"><span className="metric-label">{label}</span><span className={`metric-swatch ${tone}`} /></div><div className="metric-bottom"><strong className="metric-value">{value}</strong>{trend && <span className={`metric-change ${tone === 'orange' ? 'down' : 'up'}`}>{trend}</span>}</div><p className="metric-detail">{detail}</p></article>;
@@ -189,21 +202,195 @@ export function OverviewPage({
 }
 
 const severityLabel: Record<AlertLevel, string> = { critical: '严重', warning: '警告', info: '提示' };
-const stateLabel: Record<AlertState, string> = { active: '待处理', acknowledged: '已确认', resolved: '已关闭' };
-export function AlertsPage({ onNotify, environment }: { onNotify: (message: string) => void; environment: string }) {
-  const [items, setItems] = useState(mockAlerts);
-  const [filter, setFilter] = useState<'all' | 'active' | 'resolved'>('all');
-  const [level, setLevel] = useState('all');
-  const [muted, setMuted] = useState(false);
-  const scopedItems = items.filter((item) => environment === 'all' || item.environment === environment);
-  const filtered = scopedItems.filter((item) => (filter === 'all' || (filter === 'active' ? item.state !== 'resolved' : item.state === 'resolved')) && (level === 'all' || item.level === level));
-  const changeState = (id: string, state: AlertState) => setItems((current) => current.map((item) => item.id === id ? { ...item, state } : item));
+const stateLabel: Record<AlertState, string> = { active: '待确认', acknowledged: '已确认', resolved: '已关闭' };
+
+type AlertLoadState<T> =
+  | { scopeKey: string; status: 'loading' }
+  | { scopeKey: string; status: 'error'; message: string }
+  | { scopeKey: string; status: 'ready'; data: T };
+
+const builtInAlertRules = [
+  { rule: 'span_latency', title: '慢 Span', threshold: 'Span 耗时 > 2,000 ms' },
+  { rule: 'llm_token_threshold', title: 'LLM 单次 Token', threshold: '单次 llm.generate 总 Token > 5,000；Token 是用量代理，不代表货币成本。' },
+  { rule: 'rag_empty_recall', title: 'RAG 空召回', threshold: '成功的 rag.retrieve，且明确报告 0 条召回（recalled_count / retrievedCount / 空 sources）' },
+  { rule: 'span_error', title: 'Span 错误', threshold: 'Span status = error 时逐条触发' },
+] as const;
+
+function alertTime(value: string): string {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return '—';
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+  }).format(date);
+}
+
+function alertErrorMessage(error: unknown): string {
+  return error instanceof AlertApiError ? error.message : '读取告警数据失败，请稍后重试。';
+}
+
+function AlertSummaryCard({ label, value, note, tone }: { label: string; value: string; note: string; tone?: 'critical' }) {
+  return <article className={tone ? `alert-summary-card ${tone}` : 'alert-summary-card'}><span>{label}</span><strong>{value}<small> 条</small></strong><em>{note}</em></article>;
+}
+
+function alertAction(alert: AlertItem): { state: AlertState; label: string }[] {
+  if (alert.state === 'active') return [{ state: 'acknowledged', label: '确认' }, { state: 'resolved', label: '关闭' }];
+  if (alert.state === 'acknowledged') return [{ state: 'resolved', label: '关闭' }];
+  return [{ state: 'active', label: '重新打开' }];
+}
+
+export function AlertsPage({
+  projectId,
+  environment,
+  onNotify,
+  onSelectTrace,
+}: {
+  projectId: string;
+  environment: OverviewEnvironment;
+  onNotify: (message: string) => void;
+  onSelectTrace: (traceId: string, environment: TraceEnvironment, lastSeenAt: string) => void;
+}) {
+  const [stateFilter, setStateFilter] = useState<AlertStateFilter>('all');
+  const [levelFilter, setLevelFilter] = useState<AlertLevelFilter>('all');
+  const [page, setPage] = useState(1);
+  const [listRetry, setListRetry] = useState(0);
+  const [summaryRetry, setSummaryRetry] = useState(0);
+  const [refreshVersion, setRefreshVersion] = useState(0);
+  const [pendingAlertId, setPendingAlertId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState('');
+  const [listState, setListState] = useState<AlertLoadState<AlertListResponse>>({ scopeKey: '', status: 'loading' });
+  const [summaryState, setSummaryState] = useState<AlertLoadState<AlertSummary>>({ scopeKey: '', status: 'loading' });
+
+  const listScopeKey = JSON.stringify([projectId, environment, stateFilter, levelFilter, page, listRetry, refreshVersion]);
+  const summaryScopeKey = JSON.stringify([projectId, environment, summaryRetry, refreshVersion]);
+  const listScopeRef = useRef(listScopeKey);
+  const summaryScopeRef = useRef(summaryScopeKey);
+  listScopeRef.current = listScopeKey;
+  summaryScopeRef.current = summaryScopeKey;
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const scopeKey = listScopeKey;
+    setListState({ scopeKey, status: 'loading' });
+    fetchAlerts({ projectId, environment, state: stateFilter, level: levelFilter, page, pageSize: 20 }, controller.signal)
+      .then((data) => {
+        if (!controller.signal.aborted && listScopeRef.current === scopeKey) setListState({ scopeKey, status: 'ready', data });
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted && listScopeRef.current === scopeKey) {
+          setListState({ scopeKey, status: 'error', message: alertErrorMessage(error) });
+        }
+      });
+    return () => controller.abort();
+  }, [projectId, environment, stateFilter, levelFilter, page, listRetry, refreshVersion, listScopeKey]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const scopeKey = summaryScopeKey;
+    setSummaryState({ scopeKey, status: 'loading' });
+    fetchAlertSummary(projectId, environment, controller.signal)
+      .then((data) => {
+        if (!controller.signal.aborted && summaryScopeRef.current === scopeKey) setSummaryState({ scopeKey, status: 'ready', data });
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted && summaryScopeRef.current === scopeKey) {
+          setSummaryState({ scopeKey, status: 'error', message: alertErrorMessage(error) });
+        }
+      });
+    return () => controller.abort();
+  }, [projectId, environment, summaryRetry, refreshVersion, summaryScopeKey]);
+
+  const visibleList: AlertLoadState<AlertListResponse> = listState.scopeKey === listScopeKey
+    ? listState
+    : { scopeKey: listScopeKey, status: 'loading' };
+  const visibleSummary: AlertLoadState<AlertSummary> = summaryState.scopeKey === summaryScopeKey
+    ? summaryState
+    : { scopeKey: summaryScopeKey, status: 'loading' };
+  const data = visibleList.status === 'ready' ? visibleList.data : undefined;
+  const alerts = data?.items ?? [];
+  const summary = visibleSummary.status === 'ready' ? visibleSummary.data : undefined;
+  const pageCount = data ? Math.max(1, Math.ceil(data.total / data.pageSize)) : 1;
+
+  useEffect(() => {
+    if (data && page > pageCount) setPage(pageCount);
+  }, [data, page, pageCount]);
+
+  const changeFilters = (nextState: AlertStateFilter, nextLevel: AlertLevelFilter) => {
+    setPage(1);
+    setStateFilter(nextState);
+    setLevelFilter(nextLevel);
+  };
+
+  const changeState = async (alert: AlertItem, nextState: AlertState) => {
+    if (pendingAlertId) return;
+    setPendingAlertId(alert.id);
+    setActionError('');
+    try {
+      await updateAlertState(alert.id, nextState);
+      setRefreshVersion((version) => version + 1);
+      const action = nextState === 'acknowledged' ? '已确认' : nextState === 'resolved' ? '已关闭' : '已重新打开';
+      onNotify(`告警已${action}，列表已同步。`);
+    } catch (error) {
+      setActionError(alertErrorMessage(error));
+    } finally {
+      setPendingAlertId(null);
+    }
+  };
+
+  const emptyMessage = summary && summary.total > 0
+    ? '当前状态和级别筛选下没有告警。'
+    : '当前项目与环境范围内暂无告警。';
+
   return <section className="module-page alerts-page">
-    <PageIntro eyebrow="ALERTS / INCIDENTS" title="把异常跟进到有结论。" description="演示告警与真实 Trace 查询隔离；可按严重程度查看并在当前页面试用处理状态。" actions={<><button className={`button secondary ${muted ? 'button-muted' : ''}`} type="button" onClick={() => { setMuted((value) => !value); onNotify(muted ? '告警通知已恢复' : '演示规则已静默 1 小时'); }}><span className="bell-mark">{muted ? '◌' : '⌁'}</span>{muted ? '恢复通知' : '静默 1 小时'}</button><button className="button primary" type="button" onClick={() => onNotify('规则配置表单将在告警规则迭代中开放')}><Icon name="plus" size={15} />新建规则</button></>} />
-    <div className="alert-summary-grid"><article><span>待处理告警</span><strong>{scopedItems.filter((item) => item.state !== 'resolved').length}<small> 条</small></strong><em>当前环境</em></article><article><span>严重告警</span><strong>{scopedItems.filter((item) => item.level === 'critical' && item.state !== 'resolved').length}<small> 条</small></strong><em>优先跟进</em></article><article><span>已确认</span><strong>{scopedItems.filter((item) => item.state === 'acknowledged').length}<small> 条</small></strong><em>处理中</em></article><article><span>已关闭</span><strong>{scopedItems.filter((item) => item.state === 'resolved').length}<small> 条</small></strong><em>最近 24 小时</em></article></div>
-    <section className="panel alert-table-panel"><div className="alert-toolbar"><div className="segmented-tabs small-tabs" role="tablist" aria-label="告警状态筛选">{([{ id: 'all', label: '全部' }, { id: 'active', label: '待处理' }, { id: 'resolved', label: '已关闭' }] as const).map((item) => <button type="button" key={item.id} className={filter === item.id ? 'active' : ''} onClick={() => setFilter(item.id)}>{item.label}</button>)}</div><label className="compact-filter"><span>级别</span><select value={level} onChange={(event) => setLevel(event.target.value)} aria-label="按告警级别筛选"><option value="all">全部级别</option><option value="critical">严重</option><option value="warning">警告</option><option value="info">提示</option></select></label></div>
-      <div className="table-scroll data-table-scroll"><table className="data-table"><thead><tr><th>级别</th><th>告警</th><th>服务</th><th>规则</th><th>关联 Trace</th><th>状态</th><th>发生时间</th><th>操作</th></tr></thead><tbody>{filtered.map((alert) => <tr key={alert.id}><td><StatusPill status={alert.level === 'critical' ? 'error' : alert.level === 'warning' ? 'warning' : 'info'}>{severityLabel[alert.level]}</StatusPill></td><td className="alert-description-cell"><strong>{alert.title}</strong><small>{alert.description}</small></td><td>{alert.service}</td><td><code>{alert.rule}</code></td><td>{alert.traceId ? <button className="trace-id" type="button" onClick={() => onNotify('这是演示告警关联 ID，不能用于真实 Trace 查询。')}>{alert.traceId.slice(0, 8)}…（演示）</button> : '—'}</td><td><span className={`alert-state ${alert.state}`}>{stateLabel[alert.state]}</span></td><td>{alert.time}</td><td><div className="row-actions">{alert.state === 'active' && <button type="button" onClick={() => changeState(alert.id, 'acknowledged')}>确认</button>}{alert.state !== 'resolved' && <button type="button" onClick={() => changeState(alert.id, 'resolved')}>关闭</button>}{alert.state === 'resolved' && <button type="button" onClick={() => changeState(alert.id, 'active')}>重新打开</button>}</div></td></tr>)}</tbody></table>{filtered.length === 0 && <div className="empty-state">没有符合条件的告警。</div>}</div>
-      <div className="table-footer"><span>演示告警 · 状态修改仅在当前页面生效</span><span>{filtered.length} 条记录</span></div>
+    <PageIntro eyebrow="ALERTS / INCIDENTS" title="把异常跟进到有结论。" description="查看服务端内置规则产生的告警，并从告警直接定位关联 Trace。列表和统计随当前项目与环境更新。" />
+
+    {visibleSummary.status === 'error' && <div className="alert-load-error summary-error" role="alert"><span>{visibleSummary.message}</span><button className="text-action" type="button" onClick={() => setSummaryRetry((count) => count + 1)}>重试<Icon name="arrow" size={14} /></button></div>}
+    <div className="alert-summary-grid" aria-busy={visibleSummary.status === 'loading'}>
+      <AlertSummaryCard label="告警总数" value={summary ? formatCount(summary.total) : visibleSummary.status === 'loading' ? '…' : '—'} note="当前项目 / 环境" />
+      <AlertSummaryCard label="待确认" value={summary ? formatCount(summary.active) : visibleSummary.status === 'loading' ? '…' : '—'} note="等待处理" />
+      <AlertSummaryCard label="处理中" value={summary ? formatCount(summary.acknowledged) : visibleSummary.status === 'loading' ? '…' : '—'} note="已确认" />
+      <AlertSummaryCard label="严重待确认" value={summary ? formatCount(summary.criticalActive) : visibleSummary.status === 'loading' ? '…' : '—'} note="优先跟进" tone="critical" />
+      <AlertSummaryCard label="已关闭" value={summary ? formatCount(summary.resolved) : visibleSummary.status === 'loading' ? '…' : '—'} note="已完成处理" />
+    </div>
+
+    <section className="panel alert-rules-panel" aria-labelledby="alert-rules-title">
+      <div className="panel-heading"><div><h2 id="alert-rules-title">本期内置规则与固定阈值</h2><small>规则与阈值固定、不可编辑；每条告警的 rule、title 和触发说明以 API 返回为准。</small></div><span className="rules-static-label">固定规则</span></div>
+      <div className="alert-rule-grid">{builtInAlertRules.map((rule) => <article key={rule.rule}><code>{rule.rule}</code><strong>{rule.title}</strong><p>{rule.threshold}</p></article>)}</div>
+      <p className="alert-rules-footnote">LLM Token 只作为成本代理指标；未配置模型价格，不代表货币金额。</p>
+    </section>
+
+    <section className="panel alert-table-panel" aria-label="告警列表">
+      <div className="alert-toolbar">
+        <div className="alert-filter-group">
+          <label className="compact-filter"><span>状态</span><select value={stateFilter} onChange={(event) => changeFilters(event.target.value as AlertStateFilter, levelFilter)} aria-label="按告警状态筛选">
+            <option value="all">全部状态</option><option value="active">待确认</option><option value="acknowledged">已确认</option><option value="resolved">已关闭</option>
+          </select></label>
+          <label className="compact-filter"><span>级别</span><select value={levelFilter} onChange={(event) => changeFilters(stateFilter, event.target.value as AlertLevelFilter)} aria-label="按告警级别筛选">
+            <option value="all">全部级别</option><option value="critical">严重</option><option value="warning">警告</option><option value="info">提示</option>
+          </select></label>
+        </div>
+        <span className="alert-scope-label">{environment === 'all' ? '全部环境' : environment} · 每页 20 条</span>
+      </div>
+
+      {actionError && <div className="alert-load-error alert-action-error" role="alert"><span>{actionError}</span></div>}
+      <div className="table-scroll data-table-scroll alert-data-scroll"><table className="data-table alert-data-table"><thead><tr><th>级别</th><th>告警 / 触发说明</th><th>服务</th><th>环境</th><th>规则</th><th>关联 Trace</th><th>状态</th><th>最近发生</th><th>触发次数</th><th>操作</th></tr></thead><tbody>
+        {visibleList.status === 'loading' && <tr><td colSpan={10} className="alert-table-state" role="status">正在读取当前项目与环境的告警…</td></tr>}
+        {visibleList.status === 'error' && <tr><td colSpan={10} className="alert-table-state error" role="alert"><span>{visibleList.message}</span><button className="text-action" type="button" onClick={() => setListRetry((count) => count + 1)}>重试<Icon name="arrow" size={14} /></button></td></tr>}
+        {visibleList.status === 'ready' && alerts.length === 0 && <tr><td colSpan={10} className="alert-table-state empty" role="status">{emptyMessage}</td></tr>}
+        {visibleList.status === 'ready' && alerts.map((alert) => <tr key={alert.id}>
+          <td><StatusPill status={alert.level === 'critical' ? 'error' : alert.level === 'warning' ? 'warning' : 'info'}>{severityLabel[alert.level]}</StatusPill></td>
+          <td className="alert-description-cell"><strong>{alert.title}</strong><small>{alert.message}</small></td>
+          <td>{alert.service}</td>
+          <td><span className="env-tag">{alert.environment}</span></td>
+          <td><code>{alert.rule}</code></td>
+          <td><button className="trace-id" type="button" aria-label={`查看 Trace ${alert.traceId}（${alert.environment}）`} onClick={() => onSelectTrace(alert.traceId, alert.environment, alert.lastSeenAt)}>{alert.traceId.slice(0, 12)}…</button></td>
+          <td><span className={`alert-state ${alert.state}`}>{stateLabel[alert.state]}</span></td>
+          <td className="alert-seen-cell"><time dateTime={alert.lastSeenAt}>{alertTime(alert.lastSeenAt)}</time><small>首次 {alertTime(alert.firstSeenAt)}</small></td>
+          <td className="alert-count-cell">{formatCount(alert.triggerCount)}</td>
+          <td><div className="row-actions">{alertAction(alert).map((action) => <button key={action.state} type="button" disabled={pendingAlertId !== null} onClick={() => void changeState(alert, action.state)}>{pendingAlertId === alert.id ? '保存中…' : action.label}</button>)}</div></td>
+        </tr>)}
+      </tbody></table></div>
+
+      <div className="alert-pagination"><span>{data && data.total > 0 ? `显示 ${(page - 1) * 20 + 1}–${Math.min(page * 20, data.total)} 条，共 ${formatCount(data.total)} 条` : data ? '0 条告警' : '列表数据待加载'}</span><div><button type="button" disabled={!data || page <= 1} onClick={() => setPage((current) => Math.max(1, current - 1))}>上一页</button><span>第 {page} / {pageCount} 页</span><button type="button" disabled={!data || page >= pageCount} onClick={() => setPage((current) => Math.min(pageCount, current + 1))}>下一页</button></div></div>
     </section>
   </section>;
 }

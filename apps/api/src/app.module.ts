@@ -9,6 +9,7 @@ import { SpansModule } from './spans/spans.module';
 import { TraceIdMiddleware } from './trace/trace-id.middleware';
 import { TracesModule } from './traces/traces.module';
 import { MetricsModule } from './metrics/metrics.module';
+import { AlertsModule } from './alerts/alerts.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { MetricsModule } from './metrics/metrics.module';
     ObservabilityModule,
     TracesModule,
     MetricsModule,
+    AlertsModule,
   ],
   controllers: [HealthController],
 })

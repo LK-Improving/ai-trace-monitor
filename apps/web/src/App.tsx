@@ -10,7 +10,7 @@ import {
   type OverviewResponse,
   type ProjectOption,
 } from './overview-api';
-import { createTimeWindow, fetchTraceList, type TraceListResponse } from './chain-api';
+import { createTimeWindow, createTimeWindowAround, fetchTraceList, type TraceListResponse } from './chain-api';
 import { AiChainPage, TraceDetail, TraceExplorer, type TraceSelection } from './pages/LivePages';
 import { AlertsPage, DocsPage, OverviewPage, SettingsPage } from './pages/Pages';
 
@@ -55,7 +55,7 @@ function formatGeneratedAt(value: string): string {
 }
 
 function isApiPage(page: PageName): boolean {
-  return page === 'overview' || page === 'traces' || page === 'ai';
+  return page === 'overview' || page === 'traces' || page === 'ai' || page === 'alerts';
 }
 
 function ProjectGate({ state, onRetry }: { state: ProjectState; onRetry: () => void }) {
@@ -193,7 +193,6 @@ export default function App() {
       : projectState.status === 'ready' && projectState.projects.length === 0 ? '暂无可用项目'
         : currentOverview.status === 'ready' ? 'API 数据' : 'API 读取中'
     : isApiPage(page) ? 'API 查询' : '演示数据';
-  const demoEnvironment = environment === 'prod' ? 'production' : environment === 'dev' ? 'development' : environment;
   const tracePageKey = JSON.stringify([projectId, environment, timeRange]);
   const selectedTraceKey = selectedTrace
     ? JSON.stringify([projectId, selectedTrace.traceId, selectedTrace.environment, selectedTrace.window.from, selectedTrace.window.to])
@@ -250,7 +249,19 @@ export default function App() {
         {page === 'ai' && (!selectedProject
           ? <ProjectGate state={projectState} onRetry={retryProjects} />
           : <AiChainPage key={`ai:${tracePageKey}`} projectId={selectedProject.id} environment={environment} range={timeRange} />)}
-        {page === 'alerts' && <AlertsPage environment={environment === 'all' ? 'all' : demoEnvironment} onNotify={notify} />}
+        {page === 'alerts' && (!selectedProject
+          ? <ProjectGate state={projectState} onRetry={retryProjects} />
+          : <AlertsPage
+            key={JSON.stringify([selectedProject.id, environment])}
+            projectId={selectedProject.id}
+            environment={environment}
+            onNotify={notify}
+            onSelectTrace={(traceId, traceEnvironment, lastSeenAt) => openTrace({
+              traceId,
+              environment: traceEnvironment,
+              window: createTimeWindowAround(lastSeenAt),
+            })}
+          />)}
         {page === 'settings' && <SettingsPage onNotify={notify} />}
         {page === 'docs' && <DocsPage onNotify={notify} />}
         <footer className="page-footer"><span>TRACE OPS <i>·</i> AI 全链路监控</span><span>{getRangeLabel(timeRange)} <i>·</i> {isApiPage(page) ? '接口数据' : '演示数据'}</span></footer>

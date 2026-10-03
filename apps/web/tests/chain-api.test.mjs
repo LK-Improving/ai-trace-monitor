@@ -26,6 +26,17 @@ const WINDOW = { from: FROM, to: TO };
 const TRACE_ID = 'trace-same-id';
 const HASH = 'a'.repeat(64);
 
+test('alert timestamp windows center on lastSeenAt and stay within the 30-day query limit', () => {
+  const center = '2026-10-02T03:05:05.000Z';
+  const window = chain.createTimeWindowAround(center);
+  assert.deepEqual(window, {
+    from: '2026-10-02T02:50:05.000Z',
+    to: '2026-10-02T03:20:05.000Z',
+  });
+  assert.equal(Date.parse(window.to) - Date.parse(window.from), 30 * 60 * 1000);
+  assert.throws(() => chain.createTimeWindowAround('not-a-timestamp'), /Invalid time window center/);
+});
+
 function span(spanId, parentSpanId = null, attributes = {}) {
   return {
     spanId,

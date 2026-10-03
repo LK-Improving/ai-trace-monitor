@@ -4,6 +4,7 @@ export interface AdminProxyOptions {
   adminToken?: string | (() => string | undefined);
   apiPort?: number | string | (() => number | string | undefined);
   timeoutMs?: number;
+  bodyTimeoutMs?: number;
   maxResponseBytes?: number;
 }
 

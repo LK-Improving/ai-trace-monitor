@@ -1,0 +1,17 @@
+{
+  "status": "passed",
+  "cleanup": "passed",
+  "checks": [
+    "old Postgres volume/API startup",
+    "four fixed rules and exact threshold boundaries",
+    "explicit empty-RAG evidence; absent metadata is not treated as empty",
+    "duplicate business Span ingest at a new Kafka offset does not duplicate alerts or inflate triggerCount",
+    "ClickHouse insert_deduplication_token suppresses a same-batch write retry",
+    "project and environment filtering",
+    "admin authentication and state validation",
+    "active -> acknowledged -> resolved -> reopened lifecycle",
+    "unstructured Span error content is not returned"
+  ],
+  "cleanupFailures": [],
+  "noSensitiveProcessOutput": true
+}

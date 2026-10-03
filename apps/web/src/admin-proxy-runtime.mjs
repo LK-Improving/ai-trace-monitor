@@ -3,18 +3,22 @@ import { request as httpRequest } from 'node:http';
 const MAX_QUERY_LENGTH = 4096;
 const DEFAULT_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 10_000;
+const MAX_ALERT_STATE_BODY_BYTES = 1024;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TRACE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 const ENVIRONMENTS = new Set(['dev', 'staging', 'prod']);
 const OVERVIEW_ENVIRONMENTS = new Set(['dev', 'staging', 'prod', 'all']);
 const METRIC_RANGES = new Set(['1h', '24h', '7d']);
+const ALERT_STATES = new Set(['active', 'acknowledged', 'resolved', 'all']);
+const ALERT_LEVELS = new Set(['info', 'warning', 'critical', 'all']);
 
 const ADMIN_PATH_PREFIXES = [
   '/api/v1/projects',
   '/api/v1/overview',
   '/api/v1/metrics',
   '/api/v1/traces',
+  '/api/v1/alerts',
 ];
 
 const SAFE_ERRORS = {
@@ -26,22 +30,27 @@ const SAFE_ERRORS = {
   forbidden: {
     status: 403,
     error: 'local_same_origin_required',
-    message: '管理查询仅允许来自本机同源开发页面的读取请求。',
+    message: '管理请求仅允许来自本机同源开发页面。',
   },
   method: {
     status: 405,
     error: 'method_not_allowed',
-    message: '本地管理查询代理只允许 GET。',
+    message: '本地管理代理仅允许白名单读取和告警状态修改。',
   },
   notAllowed: {
     status: 404,
     error: 'admin_route_not_allowed',
-    message: '该管理 API 路径不在本地只读代理白名单中。',
+    message: '该管理 API 路径不在本地代理白名单中。',
   },
   bodyNotAllowed: {
     status: 400,
     error: 'request_body_not_allowed',
     message: '本地管理查询不接受请求体。',
+  },
+  invalidAlertStateBody: {
+    status: 400,
+    error: 'invalid_alert_state_body',
+    message: '告警状态请求体必须是仅包含有效 state 字段的 JSON 对象。',
   },
   missingCredential: {
     status: 401,
@@ -77,6 +86,11 @@ function exactRoute(pathname) {
   if (pathname === '/api/v1/metrics/overview') return { name: 'metricsOverview', path: pathname };
   if (pathname === '/api/v1/metrics/ai') return { name: 'metricsAi', path: pathname };
   if (pathname === '/api/v1/traces') return { name: 'traces', path: pathname };
+  if (pathname === '/api/v1/alerts') return { name: 'alerts', path: pathname };
+  if (pathname === '/api/v1/alerts/summary') return { name: 'alertSummary', path: pathname };
+
+  const alertStateMatch = pathname.match(/^\/api\/v1\/alerts\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/state$/i);
+  if (alertStateMatch) return { name: 'alertState', path: pathname, alertId: alertStateMatch[1] };
 
   const detailPrefix = '/api/v1/traces/';
   if (pathname.startsWith(detailPrefix)) {
@@ -243,6 +257,40 @@ function validTraceDetailQuery(route, query) {
   return from === undefined || validWindow(from, to);
 }
 
+function validAlertListQuery(query) {
+  const allowed = new Set(['projectId', 'environment', 'state', 'level', 'page', 'pageSize']);
+  if (!hasOnlyKeys(query, allowed) || !UUID_PATTERN.test(query.get('projectId') ?? '')) return false;
+
+  const environment = query.get('environment');
+  if (environment === undefined || !OVERVIEW_ENVIRONMENTS.has(environment)) return false;
+  const state = query.get('state') ?? 'all';
+  const level = query.get('level') ?? 'all';
+  if (!ALERT_STATES.has(state) || !ALERT_LEVELS.has(level)) return false;
+
+  const page = query.get('page') ?? '1';
+  const pageSize = query.get('pageSize') ?? '20';
+  if (!validPositiveInteger(page, 1000) || !validPositiveInteger(pageSize, 100)) return false;
+  return (Number(page) - 1) * Number(pageSize) <= 10_000;
+}
+
+function validAlertSummaryQuery(query) {
+  const allowed = new Set(['projectId', 'environment']);
+  return hasOnlyKeys(query, allowed)
+    && UUID_PATTERN.test(query.get('projectId') ?? '')
+    && OVERVIEW_ENVIRONMENTS.has(query.get('environment'));
+}
+
+/** Parse a deliberately narrow JSON shape so duplicate or extra keys cannot be hidden by JSON.parse. */
+export function validateAlertStateBody(rawBody) {
+  if (typeof rawBody !== 'string' || Buffer.byteLength(rawBody, 'utf8') > MAX_ALERT_STATE_BODY_BYTES) {
+    return SAFE_ERRORS.invalidAlertStateBody;
+  }
+  const match = rawBody.match(/^\s*\{\s*"state"\s*:\s*"(active|acknowledged|resolved)"\s*\}\s*$/);
+  return match
+    ? { valid: true, state: match[1] }
+    : SAFE_ERRORS.invalidAlertStateBody;
+}
+
 /** Validate query values against the matching backend controller DTO rules. */
 export function validateAdminQuery(route, rawQuery) {
   const query = queryMap(rawQuery);
@@ -266,6 +314,15 @@ export function validateAdminQuery(route, rawQuery) {
     case 'traceDetail':
       result = validTraceDetailQuery(route, query);
       if (typeof result === 'object') return result;
+      break;
+    case 'alerts':
+      result = validAlertListQuery(query);
+      break;
+    case 'alertSummary':
+      result = validAlertSummaryQuery(query);
+      break;
+    case 'alertState':
+      result = query.size === 0 && UUID_PATTERN.test(route.alertId ?? '');
       break;
     default:
       return invalidQuery();
@@ -387,6 +444,69 @@ function hasRequestBody(request) {
   return contentLength[0] !== '0';
 }
 
+function readAlertStateBody(request, options, callback) {
+  const contentTypes = rawHeaderValues(request, 'content-type');
+  const contentLengths = rawHeaderValues(request, 'content-length');
+  const transferEncodings = rawHeaderValues(request, 'transfer-encoding');
+  const contentEncodings = rawHeaderValues(request, 'content-encoding');
+  const expectations = rawHeaderValues(request, 'expect');
+  const contentType = contentTypes[0] ?? '';
+  const contentLength = contentLengths[0];
+  const validContentType = contentTypes.length === 1
+    && /^application\/json(?:\s*;\s*charset\s*=\s*(?:"utf-8"|utf-8))?$/i.test(contentType);
+  const validLength = contentLengths.length === 1
+    && /^(?:[1-9]\d{0,2}|102[0-4])$/.test(contentLength ?? '')
+    && Number(contentLength) <= MAX_ALERT_STATE_BODY_BYTES;
+  const validChunked = contentLengths.length === 0
+    && transferEncodings.length === 1
+    && transferEncodings[0].toLowerCase() === 'chunked';
+
+  if (!validContentType || contentEncodings.length > 0 || expectations.length > 0
+    || (transferEncodings.length > 0 && !validChunked)
+    || (contentLengths.length > 0 && !validLength)
+    || (!validLength && !validChunked)) {
+    request.resume?.();
+    callback(SAFE_ERRORS.invalidAlertStateBody);
+    return;
+  }
+
+  let settled = false;
+  let byteLength = 0;
+  const chunks = [];
+  const timeoutMs = Number.isInteger(options.bodyTimeoutMs) && options.bodyTimeoutMs > 0
+    ? options.bodyTimeoutMs
+    : DEFAULT_TIMEOUT_MS;
+  const finish = (result) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeout);
+    if (result !== undefined && !result.valid) request.resume?.();
+    callback(result);
+  };
+  const timeout = setTimeout(() => finish(SAFE_ERRORS.invalidAlertStateBody), timeoutMs);
+
+  request.on('data', (chunk) => {
+    if (settled) return;
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    byteLength += buffer.length;
+    if (byteLength > MAX_ALERT_STATE_BODY_BYTES) {
+      finish(SAFE_ERRORS.invalidAlertStateBody);
+      return;
+    }
+    chunks.push(buffer);
+  });
+  request.on('end', () => {
+    if (settled) return;
+    if (validLength && byteLength !== Number(contentLength)) {
+      finish(SAFE_ERRORS.invalidAlertStateBody);
+      return;
+    }
+    finish(validateAlertStateBody(Buffer.concat(chunks).toString('utf8')));
+  });
+  request.on('aborted', () => finish(SAFE_ERRORS.invalidAlertStateBody));
+  request.on('error', () => finish(SAFE_ERRORS.invalidAlertStateBody));
+}
+
 function validPort(value) {
   const source = String(value ?? '');
   if (!/^\d{1,5}$/.test(source)) return undefined;
@@ -394,7 +514,7 @@ function validPort(value) {
   return port >= 1 && port <= 65535 ? port : undefined;
 }
 
-function proxyValidatedRead(request, response, options, route, search) {
+function proxyValidatedRequest(request, response, options, route, search, method, body) {
   const rawToken = resolveOption(options.adminToken, undefined);
   const token = typeof rawToken === 'string' ? rawToken.trim() : '';
   if (!token || token.length > 8192 || !/^[\x21-\x7e]+$/.test(token)) {
@@ -440,12 +560,16 @@ function proxyValidatedRead(request, response, options, route, search) {
     upstreamRequest = httpRequest({
       hostname: '127.0.0.1',
       port,
-      method: 'GET',
+      method,
       path: upstreamPath,
       agent: false,
       headers: {
         Authorization: `Bearer ${token}`,
         Accept: 'application/json',
+        ...(body === undefined ? {} : {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        }),
       },
     }, (upstreamResponse) => {
       upstreamResponse.on('error', () => abortUpstream(SAFE_ERRORS.upstreamUnavailable));
@@ -456,6 +580,17 @@ function proxyValidatedRead(request, response, options, route, search) {
           ? { error: 'admin_upstream_rejected', message: '本地管理 API 未接受该查询。' }
           : SAFE_ERRORS.upstreamUnavailable;
         abortUpstream(definition, safeStatus);
+        return;
+      }
+
+      if (status === 204 && method === 'PATCH') {
+        settled = true;
+        clearDeadline();
+        response.statusCode = status;
+        response.setHeader('Cache-Control', 'no-store');
+        response.setHeader('X-Content-Type-Options', 'nosniff');
+        response.end();
+        upstreamRequest.destroy();
         return;
       }
 
@@ -522,7 +657,7 @@ function proxyValidatedRead(request, response, options, route, search) {
       upstreamRequest.destroy();
     }
   });
-  upstreamRequest.end();
+  upstreamRequest.end(body);
 }
 
 /**
@@ -546,18 +681,21 @@ export function createAdminProxy(options = {}) {
       sendSafeError(response, SAFE_ERRORS.forbidden);
       return;
     }
-    if (request.method !== 'GET') {
-      request.resume?.();
-      response.setHeader('Allow', 'GET');
-      sendSafeError(response, SAFE_ERRORS.method);
-      return;
-    }
     if (!inspected.valid) {
       request.resume?.();
       sendSafeError(response, inspected.reason === 'route' ? SAFE_ERRORS.notAllowed : SAFE_ERRORS.badTarget);
       return;
     }
-    if (hasRequestBody(request)) {
+
+    const expectedMethod = inspected.route.name === 'alertState' ? 'PATCH' : 'GET';
+    if (request.method !== expectedMethod) {
+      request.resume?.();
+      response.setHeader('Allow', expectedMethod);
+      sendSafeError(response, SAFE_ERRORS.method);
+      return;
+    }
+
+    if (expectedMethod === 'GET' && hasRequestBody(request)) {
       request.resume?.();
       sendSafeError(response, SAFE_ERRORS.bodyNotAllowed);
       return;
@@ -570,6 +708,17 @@ export function createAdminProxy(options = {}) {
       return;
     }
 
-    proxyValidatedRead(request, response, options, inspected.route, query.search);
+    if (expectedMethod === 'PATCH') {
+      readAlertStateBody(request, options, (bodyResult) => {
+        if (!bodyResult?.valid) {
+          sendSafeError(response, bodyResult ?? SAFE_ERRORS.invalidAlertStateBody);
+          return;
+        }
+        proxyValidatedRequest(request, response, options, inspected.route, '', 'PATCH', JSON.stringify({ state: bodyResult.state }));
+      });
+      return;
+    }
+
+    proxyValidatedRequest(request, response, options, inspected.route, query.search, 'GET');
   };
 }

@@ -5,6 +5,7 @@ import {
   createAdminProxy,
   inspectAdminRequestTarget,
   validateAdminQuery,
+  validateAlertStateBody,
   validateLocalSameOrigin,
 } from '../src/admin-proxy-runtime.mjs';
 
@@ -99,32 +100,38 @@ function routeFor(path) {
 
 before(async () => {
   upstreamServer = createServer((request, response) => {
-    upstreamRequests.push({
-      url: request.url,
-      method: request.method,
-      authorization: request.headers.authorization,
-      clientAuthorization: request.headers['x-client-authorization'],
-    });
-    response.statusCode = upstreamMode.status;
-    for (const [name, value] of Object.entries(upstreamMode.headers ?? {})) response.setHeader(name, value);
-    if (upstreamMode.location) response.setHeader('Location', upstreamMode.location);
-    response.setHeader('Content-Type', upstreamMode.contentType ?? 'application/json; charset=utf-8');
-    response.setHeader('Set-Cookie', 'upstream-secret=must-not-reach-browser');
-    if (upstreamMode.dripEveryMs) {
-      const mode = upstreamMode;
-      let count = 0;
-      response.write('[');
-      const dripTimer = setInterval(() => {
-        if (!response.destroyed) response.write(count++ === 0 ? '1' : ',1');
-      }, mode.dripEveryMs);
-      response.on('close', () => {
-        clearInterval(dripTimer);
-        mode.closed = true;
-        mode.onClose?.();
+    const chunks = [];
+    request.on('data', (chunk) => chunks.push(chunk));
+    request.on('end', () => {
+      upstreamRequests.push({
+        url: request.url,
+        method: request.method,
+        authorization: request.headers.authorization,
+        clientAuthorization: request.headers['x-client-authorization'],
+        contentType: request.headers['content-type'],
+        body: Buffer.concat(chunks).toString('utf8'),
       });
-      return;
-    }
-    response.end(upstreamMode.body);
+      response.statusCode = upstreamMode.status;
+      for (const [name, value] of Object.entries(upstreamMode.headers ?? {})) response.setHeader(name, value);
+      if (upstreamMode.location) response.setHeader('Location', upstreamMode.location);
+      response.setHeader('Content-Type', upstreamMode.contentType ?? 'application/json; charset=utf-8');
+      response.setHeader('Set-Cookie', 'upstream-secret=must-not-reach-browser');
+      if (upstreamMode.dripEveryMs) {
+        const mode = upstreamMode;
+        let count = 0;
+        response.write('[');
+        const dripTimer = setInterval(() => {
+          if (!response.destroyed) response.write(count++ === 0 ? '1' : ',1');
+        }, mode.dripEveryMs);
+        response.on('close', () => {
+          clearInterval(dripTimer);
+          mode.closed = true;
+          mode.onClose?.();
+        });
+        return;
+      }
+      response.end(upstreamMode.body);
+    });
   });
   upstreamPort = await listen(upstreamServer);
 
@@ -158,6 +165,9 @@ test('accepts only exact admin route shapes in origin-form', () => {
     '/api/v1/metrics/ai',
     '/api/v1/traces',
     '/api/v1/traces/trace_v1_abc-123',
+    '/api/v1/alerts',
+    '/api/v1/alerts/summary',
+    `/api/v1/alerts/${projectId}/state`,
   ];
   for (const path of accepted) assert.equal(inspectAdminRequestTarget(path)?.valid, true, path);
 
@@ -167,6 +177,9 @@ test('accepts only exact admin route shapes in origin-form', () => {
     '/api/v1/metrics/overview/export',
     '/api/v1/traces/trace_v1_abc/nested',
     '/api/v1/traces/',
+    `/api/v1/alerts/${projectId}/state/extra`,
+    '/api/v1/alerts/not-a-uuid/state',
+    '/api/v1/alerts/summary/export',
     '/api/v1/%70rojects',
     '/api/v1/projects\\..\\traces',
     '//outside.example/api/v1/projects',
@@ -284,6 +297,43 @@ test('trace detail requires project and concrete environment and forbids content
   assert.equal(validateAdminQuery({ ...route, traceId: 'bad/id' }, `projectId=${projectId}&environment=dev`).valid, false);
 });
 
+test('alert list and summary query validators accept only the shared contract filters', () => {
+  const list = routeFor('/api/v1/alerts');
+  const summary = routeFor('/api/v1/alerts/summary');
+  assert.equal(validateAdminQuery(list,
+    `projectId=${projectId}&environment=all&state=acknowledged&level=critical&page=2&pageSize=20`).valid, true);
+  assert.equal(validateAdminQuery(summary, `projectId=${projectId}&environment=prod`).valid, true);
+  assert.equal(validateAdminQuery(list,
+    `projectId=${projectId}&environment=dev&page=501&pageSize=20`).valid, true, 'offset 10,000 is the inclusive boundary');
+
+  for (const query of [
+    '',
+    `projectId=${projectId}&environment=qa`,
+    `projectId=${projectId}&environment=dev&state=open`,
+    `projectId=${projectId}&environment=dev&level=debug`,
+    `projectId=${projectId}&environment=dev&page=0`,
+    `projectId=${projectId}&environment=dev&page=1001`,
+    `projectId=${projectId}&environment=dev&page=502&pageSize=20`,
+    `projectId=${projectId}&environment=dev&debug=true`,
+  ]) assert.equal(validateAdminQuery(list, query).valid, false, query);
+  assert.equal(validateAdminQuery(summary, `projectId=${projectId}&environment=all&state=active`).valid, false);
+});
+
+test('alert state body accepts one literal enum field and rejects duplicates or extra JSON keys', () => {
+  assert.deepEqual(validateAlertStateBody('{ "state" : "acknowledged" }'), { valid: true, state: 'acknowledged' });
+  for (const body of [
+    '',
+    '{"state":"ignored"}',
+    '{"state":"active","projectId":"' + projectId + '"}',
+    '{"state":"active","state":"resolved"}',
+    '[]',
+    'null',
+    '{"state":true}',
+    '{"state":"active"} trailing',
+    'x'.repeat(1025),
+  ]) assert.equal(validateAlertStateBody(body).valid, undefined, body.slice(0, 80));
+});
+
 test('query parser rejects duplicate, array, malformed encoding, and oversized inputs', () => {
   const route = routeFor('/api/v1/metrics/ai');
   for (const query of [
@@ -354,6 +404,8 @@ test('middleware forwards only validated allowlisted GETs with the server token'
     [`/api/v1/metrics/ai?projectId=${projectId}&service=api`, `/api/v1/metrics/ai?projectId=${projectId}&service=api`],
     [`/api/v1/traces?projectId=${projectId}&from=${encodeURIComponent(startTime)}&to=${encodeURIComponent(endTime)}`, `/api/v1/traces?projectId=${projectId}&from=${encodeURIComponent(startTime)}&to=${encodeURIComponent(endTime)}`],
     [`/api/v1/traces/trace_v1_abc-123?projectId=${projectId}&environment=dev`, `/api/v1/traces/trace_v1_abc-123?projectId=${projectId}&environment=dev`],
+    [`/api/v1/alerts?projectId=${projectId}&environment=all&state=all&level=all&page=1&pageSize=20`, `/api/v1/alerts?projectId=${projectId}&environment=all&state=all&level=all&page=1&pageSize=20`],
+    [`/api/v1/alerts/summary?projectId=${projectId}&environment=prod`, `/api/v1/alerts/summary?projectId=${projectId}&environment=prod`],
   ];
 
   for (const [path, expectedPath] of cases) {
@@ -372,8 +424,99 @@ test('middleware forwards only validated allowlisted GETs with the server token'
     assert.equal(request.method, 'GET');
     assert.equal(request.authorization, `Bearer ${testToken}`);
     assert.equal(request.clientAuthorization, undefined);
+    assert.equal(request.body, '');
   }
   for (let index = 0; index < cases.length; index++) assert.equal(forwarded[index].url, cases[index][1]);
+});
+
+test('middleware forwards only the exact same-origin alert state PATCH with a normalized allowlisted body', async () => {
+  const beforeCount = upstreamRequests.length;
+  const path = `/api/v1/alerts/${projectId}/state`;
+  const response = await get(path, {
+    method: 'PATCH',
+    headers: {
+      ...localHeaders(),
+      'content-type': 'application/json; charset=utf-8',
+      authorization: 'Bearer browser-supplied-value',
+    },
+    body: '{ "state" : "acknowledged" }',
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(JSON.parse(response.body), { ok: true });
+  assert.equal(upstreamRequests.length, beforeCount + 1);
+  assert.deepEqual(upstreamRequests.at(-1), {
+    url: path,
+    method: 'PATCH',
+    authorization: `Bearer ${testToken}`,
+    clientAuthorization: undefined,
+    contentType: 'application/json',
+    body: '{"state":"acknowledged"}',
+  });
+
+  upstreamMode = { status: 204, body: '' };
+  const noContent = await get(path, {
+    method: 'PATCH',
+    headers: { ...localHeaders(), 'content-type': 'application/json' },
+    body: JSON.stringify({ state: 'resolved' }),
+  });
+  assert.equal(noContent.status, 204);
+  assert.equal(noContent.body, '');
+  upstreamMode = { status: 200, body: JSON.stringify({ ok: true }) };
+});
+
+test('middleware rejects every other PATCH route, query, origin, and body before contacting the API', async () => {
+  const beforeCount = upstreamRequests.length;
+  const path = `/api/v1/alerts/${projectId}/state`;
+  const badBodies = [
+    '{"state":"ignored"}',
+    '{"state":"active","extra":true}',
+    '{"state":"active","state":"resolved"}',
+    '[]',
+    'not-json',
+    'x'.repeat(1025),
+  ];
+  for (const body of badBodies) {
+    const response = await get(path, {
+      method: 'PATCH',
+      headers: { ...localHeaders(), 'content-type': 'application/json' },
+      body,
+    });
+    assert.equal(response.status, 400, body.slice(0, 50));
+  }
+
+  const wrongType = await get(path, {
+    method: 'PATCH',
+    headers: { ...localHeaders(), 'content-type': 'text/plain' },
+    body: '{"state":"active"}',
+  });
+  assert.equal(wrongType.status, 400);
+  const query = await get(`${path}?projectId=${projectId}`, {
+    method: 'PATCH',
+    headers: { ...localHeaders(), 'content-type': 'application/json' },
+    body: '{"state":"active"}',
+  });
+  assert.equal(query.status, 400);
+  const crossOrigin = await get(path, {
+    method: 'PATCH',
+    headers: {
+      origin: 'http://evil.example',
+      'sec-fetch-site': 'cross-site',
+      'content-type': 'application/json',
+    },
+    body: '{"state":"active"}',
+  });
+  assert.equal(crossOrigin.status, 403);
+  const generalPatch = await get('/api/v1/alerts', {
+    method: 'PATCH',
+    headers: { ...localHeaders(), 'content-type': 'application/json' },
+    body: '{"state":"active"}',
+  });
+  assert.equal(generalPatch.status, 405);
+  assert.equal(generalPatch.headers.allow, 'GET');
+  const readOnMutationRoute = await get(`/api/v1/alerts/${projectId}/state`, { headers: localHeaders() });
+  assert.equal(readOnMutationRoute.status, 405);
+  assert.equal(readOnMutationRoute.headers.allow, 'PATCH');
+  assert.equal(upstreamRequests.length, beforeCount);
 });
 
 test('middleware blocks POST, unknown query fields, includeContent=true, and non-admin SDK paths', async () => {

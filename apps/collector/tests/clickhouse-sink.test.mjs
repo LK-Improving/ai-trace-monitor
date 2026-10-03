@@ -5,7 +5,11 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const { KafkaJSError } = require('kafkajs');
 const { processSpanBatch } = require('../dist/batch-processor.js');
-const { insertWithHeartbeat } = require('../dist/clickhouse-sink.js');
+const { insertWithHeartbeat, runWithHeartbeat } = require('../dist/clickhouse-sink.js');
+const processBatch = (messages, options) => processSpanBatch(messages, {
+  source: { topic: 'clickhouse-sink-test', partition: 0 },
+  ...options,
+});
 
 const projectId = 'b35a64bb-8a12-4806-9e77-8831870a5dd0';
 
@@ -77,7 +81,7 @@ test('ClickHouse failure becomes a safe retriable Kafka error and does not reach
   let caughtError;
 
   try {
-    await processSpanBatch([makeMessage()], {
+    await processBatch([makeMessage()], {
       insert: (rows) => insertWithHeartbeat(rows, {
         async insert() { throw new Error(rawErrorText); },
         async heartbeat() {},
@@ -103,7 +107,7 @@ test('heartbeat failure becomes a safe retriable Kafka error and prevents offset
   let caughtError;
 
   try {
-    await processSpanBatch([makeMessage()], {
+    await processBatch([makeMessage()], {
       insert: (rows) => insertWithHeartbeat(rows, {
         async insert() { await delay(24); },
         async heartbeat() { throw new Error(rawErrorText); },
@@ -123,6 +127,36 @@ test('heartbeat failure becomes a safe retriable Kafka error and prevents offset
   assert.equal(caughtError.message.includes(rawErrorText), false, 'The original heartbeat error body must not be exposed');
 });
 
+test('alert persistence heartbeat failure is retriable, redacted, and blocks offset commit', async () => {
+  const privateDatabaseDetail = 'synthetic PostgreSQL statement detail';
+  let commitCalls = 0;
+  let caughtError;
+
+  try {
+    await processBatch([makeMessage()], {
+      async insert() {},
+      processAlerts: () => runWithHeartbeat(async () => {
+        await delay(20);
+        throw new Error(privateDatabaseDetail);
+      }, {
+        async heartbeat() {},
+        canContinue: () => true,
+        operationName: 'Alert persistence',
+        heartbeatPeriodMs: 5,
+      }),
+      async commit() { commitCalls += 1; },
+    });
+  } catch (error) {
+    caughtError = error;
+  }
+
+  assert.equal(commitCalls, 0);
+  assert.ok(caughtError instanceof KafkaJSError);
+  assert.equal(caughtError.retriable, true);
+  assert.equal(caughtError.cause, undefined);
+  assert.equal(caughtError.message.includes(privateDatabaseDetail), false);
+});
+
 test('partition becoming stale during a write stops heartbeats and leaves offsets uncommitted', async () => {
   let resolveInsert;
   const insertGate = new Promise((resolve) => { resolveInsert = resolve; });
@@ -130,7 +164,7 @@ test('partition becoming stale during a write stops heartbeats and leaves offset
   let heartbeatCalls = 0;
   let commitCalls = 0;
 
-  const operation = processSpanBatch([makeMessage()], {
+  const operation = processBatch([makeMessage()], {
     insert: (rows) => insertWithHeartbeat(rows, {
       async insert() { await insertGate; },
       async heartbeat() { heartbeatCalls += 1; },

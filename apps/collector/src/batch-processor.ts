@@ -1,4 +1,5 @@
-import { SpanEventSchema, toClickHouseRow } from '@trace-ops/contracts';
+import { createHash } from 'node:crypto';
+import { SpanEventSchema, toClickHouseRow, type SpanEvent } from '@trace-ops/contracts';
 
 export type CollectorMessage = {
   offset: string;
@@ -8,10 +9,22 @@ export type CollectorMessage = {
 export type InvalidReason = 'empty_payload' | 'invalid_json' | 'invalid_schema';
 
 export type ProcessSpanBatchOptions = {
-  insert(rows: ReturnType<typeof toClickHouseRow>[]): Promise<void>;
+  source: { topic: string; partition: number };
+  insert(rows: ReturnType<typeof toClickHouseRow>[], deduplicationToken: string): Promise<void>;
+  processAlerts?(spans: readonly SpanEvent[]): Promise<void>;
   commit(lastProcessedOffset: string, nextOffset: string): Promise<void>;
   onInvalid?(reason: InvalidReason, offset: string): void;
 };
+
+/** Identify the exact Kafka delivery batch so an ambiguous ClickHouse insert can be retried safely. */
+export function createClickHouseDeduplicationToken(
+  topic: string,
+  partition: number,
+  messages: readonly CollectorMessage[],
+): string {
+  const identity = JSON.stringify([topic, partition, messages.map(({ offset }) => offset)]);
+  return `trace-ops-${createHash('sha256').update(identity).digest('hex')}`;
+}
 
 export type ProcessSpanBatchResult = {
   insertedCount: number;
@@ -30,6 +43,7 @@ export async function processSpanBatch(
   }
 
   const rows: ReturnType<typeof toClickHouseRow>[] = [];
+  const spans: SpanEvent[] = [];
   let invalidCount = 0;
 
   const markInvalid = (reason: InvalidReason, offset: string): void => {
@@ -62,6 +76,7 @@ export async function processSpanBatch(
       // Span.error can contain arbitrary exception text. Keep the structured
       // status and attributes, but never persist that free-form body.
       rows.push({ ...row, error: '' });
+      spans.push(parsed.data);
     } catch {
       // Schema-valid values can still be unrepresentable by ClickHouse (for
       // example, timestamps outside JavaScript's supported date range).
@@ -72,10 +87,21 @@ export async function processSpanBatch(
   const lastProcessedOffset = messages[messages.length - 1]!.offset;
   const nextOffset = (BigInt(lastProcessedOffset) + 1n).toString();
 
+  // Persist alerts first: a PostgreSQL outage must not leave already-written
+  // business Spans behind an uncommitted Kafka offset. Both this side effect
+  // (occurrence ledger) and ClickHouse inserts are idempotent on replay.
+  if (spans.length > 0) await options.processAlerts?.(spans);
+
   if (rows.length > 0) {
-    // A rejected insert deliberately prevents the commit below. Kafka will
-    // replay the batch after the consumer's retry/restart policy takes over.
-    await options.insert(rows);
+    // The token is scoped to topic/partition and the complete ordered offset
+    // list. A lost ClickHouse acknowledgement can therefore be retried without
+    // duplicating this exact Kafka batch.
+    const deduplicationToken = createClickHouseDeduplicationToken(
+      options.source.topic,
+      options.source.partition,
+      messages,
+    );
+    await options.insert(rows, deduplicationToken);
   }
 
   // Invalid messages are deliberately discarded after safe classification;

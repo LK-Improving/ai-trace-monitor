@@ -3,9 +3,22 @@ import test from 'node:test';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { processSpanBatch } = require('../dist/batch-processor.js');
+const { createClickHouseDeduplicationToken, processSpanBatch } = require('../dist/batch-processor.js');
 
 const projectId = 'b35a64bb-8a12-4806-9e77-8831870a5dd0';
+const processBatch = (messages, options) => processSpanBatch(messages, {
+  source: { topic: 'batch-processor-test', partition: 0 },
+  ...options,
+});
+
+test('ClickHouse dedup token is stable for the same Kafka batch and isolated by topic, partition, and offsets', () => {
+  const messages = [message('12', 'one'), message('13', 'two')];
+  const token = createClickHouseDeduplicationToken('ai-spans', 2, messages);
+  assert.equal(createClickHouseDeduplicationToken('ai-spans', 2, messages), token);
+  assert.notEqual(createClickHouseDeduplicationToken('other-topic', 2, messages), token);
+  assert.notEqual(createClickHouseDeduplicationToken('ai-spans', 3, messages), token);
+  assert.notEqual(createClickHouseDeduplicationToken('ai-spans', 2, [...messages, message('14', 'three')]), token);
+});
 
 function makeSpan(overrides = {}) {
   return {
@@ -33,7 +46,7 @@ test('正常批量写入脱敏后的 ClickHouse 行，写入先于提交且 offs
   const inserted = [];
   const calls = [];
 
-  await processSpanBatch([
+  await processBatch([
     message('9007199254740991', JSON.stringify(makeSpan({
       attributes: { model: 'model-x', prompt: privateCanary },
     }))),
@@ -62,7 +75,7 @@ test('ClickHouse insert 失败时保留 Kafka offset，供失败重试或重新�
   let commitCalls = 0;
   let insertCalls = 0;
 
-  await assert.rejects(processSpanBatch([
+  await assert.rejects(processBatch([
     message('27', JSON.stringify(makeSpan())),
   ], {
     async insert() {
@@ -105,7 +118,7 @@ test('无效 payload 只产生固定安全原因码，不向日志或回调泄�
 
   let rejected = false;
   try {
-    await processSpanBatch([
+    await processBatch([
       message('31', null),
       message('32', invalidJson),
       message('33', invalidSchema),
@@ -141,7 +154,7 @@ test('纯无效批次不写入 ClickHouse，丢弃 poison messages 后提交到�
   const commits = [];
   const invalidReasons = [];
 
-  await processSpanBatch([
+  await processBatch([
     message('70', null),
     message('71', '{not-json'),
   ], {
@@ -160,7 +173,7 @@ test('空批次不执行写入或提交', async () => {
   let insertCalls = 0;
   let commitCalls = 0;
 
-  await processSpanBatch([], {
+  await processBatch([], {
     async insert() { insertCalls += 1; },
     async commit() { commitCalls += 1; },
   });
@@ -171,7 +184,7 @@ test('空批次不执行写入或提交', async () => {
 
 test('混合批次的 offset 推进覆盖已持久化消息与已分类丢弃消息', async () => {
   const commits = [];
-  await processSpanBatch([
+  await processBatch([
     message('104', JSON.stringify(makeSpan())),
     message('105', null),
   ], {
@@ -180,4 +193,26 @@ test('混合批次的 offset 推进覆盖已持久化消息与已分类丢弃消
   });
 
   assert.deepEqual(commits, [['105', '106']]);
+});
+
+test('告警 occurrence 先持久化，再写 ClickHouse，最后提交 Kafka offset', async () => {
+  const calls = [];
+  await processBatch([message('106', JSON.stringify(makeSpan()))], {
+    async insert(rows) { calls.push(['clickhouse', rows.length]); },
+    async processAlerts(spans) { calls.push(['alerts', spans.length, spans[0].spanId]); },
+    async commit() { calls.push(['commit']); },
+  });
+  assert.deepEqual(calls, [['alerts', 1, 'span-1'], ['clickhouse', 1], ['commit']]);
+});
+
+test('告警持久化失败时不写 ClickHouse，也不提交 Kafka offset', async () => {
+  let insertCalls = 0;
+  let commitCalls = 0;
+  await assert.rejects(processBatch([message('107', JSON.stringify(makeSpan()))], {
+    async insert() { insertCalls += 1; },
+    async processAlerts() { throw new Error('synthetic Postgres outage'); },
+    async commit() { commitCalls += 1; },
+  }));
+  assert.equal(insertCalls, 0, 'A Postgres failure must not leave an uncommitted ClickHouse batch behind');
+  assert.equal(commitCalls, 0);
 });

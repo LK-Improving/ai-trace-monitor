@@ -133,3 +133,28 @@ Prompt、回答、向量、文档正文/URL、原始异常和密钥不写入监�
 ## 单元测试
 
 运行 `pnpm --filter @trace-ops/api test`。测试使用 Node 内置 `node:test`，管理逻辑通过 mock 数据库覆盖，不连接或修改 PostgreSQL。
+
+## W21–W24：内置告警与处理 API
+
+Collector 对每个通过 Span Schema 校验的消息执行四条固定规则：
+
+| 规则 | 触发条件 | 默认级别 |
+| --- | --- | --- |
+| `span_error` | Span `status=error`，每个唯一 Span 触发一次 | critical |
+| `span_latency` | 有结束时间且单 Span 耗时严格大于 2,000ms | warning |
+| `llm_token_threshold` | `llm.generate` 的单次 `tokenUsage.total` 严格大于 5,000 | warning |
+| `rag_empty_recall` | 成功的 `rag.retrieve` 且明确报告零召回：`rag.recalled_count=0`、`retrievedCount=0` 或空 `sources` 数组 | warning |
+
+阈值为 MVP 固定默认值，不支持控制台编辑；Token 规则按单次模型 Span 判断，不跨请求累计。Span error 的告警消息不带原始异常正文。规则匹配结果按 `projectId/environment/service/rule` 分开聚合；每个当前未解决事件记录首次/最近触发时间与唯一触发 Span 数。重复 Kafka 投递先写入 occurrence 唯一键账本，同一项目、环境、服务、规则、Trace 和 Span 只计一次。事件已确认时，后续新 Span 增加触发数但保持 acknowledged；事件 resolved 后的新 Span 建立新事件。API 显式重开已 resolved 事件时，如果相同规则范围已有 active/acknowledged 事件，返回 409。
+
+所有接口均由 `AdminTokenGuard` 保护，需要服务端 `Authorization: Bearer <PLATFORM_ADMIN_TOKEN>`：
+
+- `GET /api/v1/alerts?projectId=<uuid>&environment=<dev|staging|prod|all>&state=<active|acknowledged|resolved|all>&level=<info|warning|critical|all>&page=1&pageSize=20`：返回 `{items,total,page,pageSize}`；默认 environment/state/level 为 `all`，page/pageSize 为 `1/20`，pageSize 上限 100，最大 offset 为 1,000,000。条目字段为 `id,title,message,rule,service,environment,level,state,traceId,spanId,firstSeenAt,lastSeenAt,triggerCount`。
+- `GET /api/v1/alerts/summary?projectId=<uuid>&environment=<dev|staging|prod|all>`：返回 `total,active,acknowledged,resolved,criticalActive`，按告警事件数统计，criticalActive 只计 active 状态。
+- `PATCH /api/v1/alerts/:id/state`，body 为 `{ "state": "acknowledged" | "resolved" | "active" }`：由 API 更新状态；active 可确认或解决，acknowledged 可解决或重开，resolved 只可重开；相同状态重复写入幂等。目标不存在返回 404，非法过滤/状态转换返回 400，重开与已有未解决事件冲突返回 409。
+
+告警 schema 位于 `infra/postgres/init/002-alerts.sql`。PostgreSQL 的 initdb SQL 只会在空 volume 执行，因此 API 与 Collector 启动时也会在 PG advisory lock 下幂等应用该迁移，兼容已存在的 Compose volume。Collector 先在 PostgreSQL 事务中写入告警 occurrence，再插入 ClickHouse，最后提交 Kafka offset。PostgreSQL 失败时不会写 ClickHouse 或提交 offset；ClickHouse 失败时 PostgreSQL occurrence 已提交，但未提交的 Kafka 批次重放会被唯一键吸收，不重复增加告警触发数。ClickHouse 使用 topic/partition/offset 批次生成去重 token，并在现有 MergeTree 表启用有限去重窗口，避免相同批次的写入重试重复落行。该去重 token 针对相同 Kafka 批次，不代表跨不同 offset 的相同业务 Span 会在 ClickHouse 合并；查询侧仍按 Span ID 去重。
+
+旧版 `alert_items.status='muted'` 不迁移到新告警 API：旧记录缺少 environment/service/built-in rule 等字段，且 muted 表示静默通知而非 resolved。旧 `alert_items` 数据原样保留，新接口只读取具备完整范围字段的 `alert_incidents`，避免把静默状态伪装为已解决。
+
+回归验证：`pnpm --filter @trace-ops/api test` 和 `node --test apps/collector/tests/*.test.mjs`。PostgreSQL 端到端幂等/状态测试默认跳过；PowerShell 中可从仓库根目录设置 `$env:TRACE_OPS_RUN_ALERTS_INTEGRATION='1'` 后运行 `node --env-file=.env --test apps/api/tests/alerts-postgres.integration.test.mjs`，完成后用 `Remove-Item Env:TRACE_OPS_RUN_ALERTS_INTEGRATION` 清除本次开关。该用例创建随机命名临时项目，并在结束时验证删除本次项目及级联数据。

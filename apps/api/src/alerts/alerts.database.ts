@@ -1,0 +1,84 @@
+import {
+  HttpException,
+  Injectable,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+const ALERT_SCHEMA_LOCK_ID = '7321198204142';
+
+function alertSchemaSql(): string {
+  const configuredPath = process.env.TRACE_OPS_ALERT_SCHEMA_PATH;
+  const candidates = [
+    ...(configuredPath ? [resolve(configuredPath)] : []),
+    resolve(process.cwd(), 'infra/postgres/init/002-alerts.sql'),
+    resolve(process.cwd(), '../../infra/postgres/init/002-alerts.sql'),
+    resolve(__dirname, '../../../../infra/postgres/init/002-alerts.sql'),
+  ];
+  const path = candidates.find((candidate) => existsSync(candidate));
+  if (!path) throw new Error('Alert schema migration file is unavailable');
+  return readFileSync(path, 'utf8');
+}
+
+@Injectable()
+export class AlertsDatabase implements OnModuleInit, OnModuleDestroy {
+  private readonly pool: Pool;
+
+  constructor(config: ConfigService) {
+    this.pool = new Pool({
+      connectionString: config.get<string>('DATABASE_URL'),
+      max: 5,
+      connectionTimeoutMillis: 5_000,
+    });
+  }
+
+  async onModuleInit(): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock($1::bigint)', [ALERT_SCHEMA_LOCK_ID]);
+      await client.query(alertSchemaSql());
+      await client.query('COMMIT');
+    } catch {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw new Error('Alert schema migration failed');
+    } finally {
+      client.release();
+    }
+  }
+
+  async query<T extends QueryResultRow = QueryResultRow>(
+    text: string,
+    values: readonly unknown[] = [],
+  ): Promise<QueryResult<T>> {
+    try {
+      return await this.pool.query<T>(text, values as unknown[]);
+    } catch {
+      throw new Error('Alert storage query failed');
+    }
+  }
+
+  async transaction<T>(operation: (client: PoolClient) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await operation(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      if (error instanceof HttpException) throw error;
+      throw new Error('Alert storage transaction failed');
+    } finally {
+      client.release();
+    }
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.pool.end();
+  }
+}

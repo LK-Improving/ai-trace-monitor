@@ -213,6 +213,22 @@ export function createTimeWindow(range: OverviewRange, nowMs = Date.now()): Time
   };
 }
 
+export function createTimeWindowAround(timestamp: string): TimeWindow {
+  const centerMs = Date.parse(timestamp);
+  if (!isTimestamp(timestamp) || !Number.isSafeInteger(centerMs)) {
+    throw new TypeError('Invalid time window center');
+  }
+
+  const radiusMs = 15 * 60 * 1000;
+  const from = new Date(centerMs - radiusMs).toISOString();
+  const to = new Date(centerMs + radiusMs).toISOString();
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(from)
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(to)) {
+    throw new TypeError('Invalid time window center');
+  }
+  return { from, to };
+}
+
 function httpErrorMessage(status: number, resource: 'Trace' | 'AI 指标'): string {
   if (status === 401) {
     return '未授权（401）：请检查本地 Vite 服务端的 PLATFORM_ADMIN_TOKEN 配置；令牌不会保存在浏览器。';
