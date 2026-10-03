@@ -109,15 +109,24 @@ export function evaluateSpanAlerts(span: SpanEvent): AlertMatch[] {
 
 function alertSchemaSql(): string {
   const configuredPath = process.env.TRACE_OPS_ALERT_SCHEMA_PATH;
-  const candidates = [
-    ...(configuredPath ? [resolve(configuredPath)] : []),
-    resolve(process.cwd(), 'infra/postgres/init/002-alerts.sql'),
-    resolve(process.cwd(), '../../infra/postgres/init/002-alerts.sql'),
-    resolve(__dirname, '../../../infra/postgres/init/002-alerts.sql'),
+  if (configuredPath) {
+    const path = resolve(configuredPath);
+    if (!existsSync(path)) throw new Error('Alert schema migration file is unavailable');
+    return readFileSync(path, 'utf8');
+  }
+  const roots = [
+    process.cwd(),
+    resolve(process.cwd(), '../..'),
+    resolve(__dirname, '../../../'),
   ];
-  const path = candidates.find((candidate) => existsSync(candidate));
-  if (!path) throw new Error('Alert schema migration file is unavailable');
-  return readFileSync(path, 'utf8');
+  for (const root of roots) {
+    const paths = [
+      resolve(root, 'infra/postgres/init/002-alerts.sql'),
+      resolve(root, 'infra/postgres/init/003-alert-notifications.sql'),
+    ];
+    if (paths.every(existsSync)) return paths.map((path) => readFileSync(path, 'utf8')).join('\n');
+  }
+  throw new Error('Alert schema migration files are unavailable');
 }
 
 function compare(left: string, right: string): number {
@@ -164,9 +173,16 @@ export class AlertEngine {
       }
       await client.query('COMMIT');
       return persistedCount;
-    } catch {
+    } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
-      throw new Error('Alert persistence failed');
+      const code = error !== null && typeof error === 'object' && 'code' in error
+        && typeof (error as { code?: unknown }).code === 'string'
+        && /^[A-Z0-9_]{2,32}$/.test((error as { code: string }).code)
+        ? (error as { code: string }).code
+        : undefined;
+      const failure = new Error('Alert persistence failed') as Error & { code?: string };
+      if (code) failure.code = code;
+      throw failure;
     } finally {
       client.release();
     }
@@ -211,6 +227,7 @@ export class AlertEngine {
     );
 
     let alertId: string;
+    let createdIncident = false;
     if (open.rows[0]) {
       const updated = await client.query<{ id: string }>(
         `UPDATE alert_incidents
@@ -249,6 +266,7 @@ export class AlertEngine {
       );
       if (created.rows.length !== 1) throw new Error('Alert incident insert failed');
       alertId = created.rows[0]!.id;
+      createdIncident = true;
     }
 
     const linked = await client.query(
@@ -259,6 +277,45 @@ export class AlertEngine {
         alert.traceId, alert.spanId, alertId],
     );
     if (linked.rowCount !== 1) throw new Error('Alert occurrence link failed');
+    if (createdIncident) await this.enqueueNotifications(client, alertId, alert);
     return true;
+  }
+
+  private async enqueueNotifications(client: PoolClient, alertId: string, alert: AlertMatch): Promise<void> {
+    const safePayload = JSON.stringify({
+      alertId,
+      title: alert.title,
+      rule: alert.rule,
+      level: alert.level,
+      service: alert.service,
+      environment: alert.environment,
+      traceId: alert.traceId,
+      spanId: alert.spanId,
+      occurredAt: alert.observedAt,
+    });
+    await client.query(
+      `INSERT INTO alert_notification_deliveries (
+         project_id, channel_id, channel_name, channel_type, event_type,
+         alert_id, alert_title, level, service, environment, trace_id, safe_payload,
+         status, attempts_in_cycle, next_attempt_at
+       )
+       SELECT $1::uuid, channel.id, channel.name, channel.channel_type, 'alert',
+              $2::uuid, $3::varchar(160), $4::varchar(16), $5::varchar(120),
+              $6::varchar(32), $7::varchar(128), $8::jsonb,
+              'queued', 0, now()
+       FROM alert_notification_channels AS channel
+       WHERE channel.project_id = $1
+         AND channel.deleted_at IS NULL
+         AND channel.enabled = true
+         AND (channel.environment = 'all' OR channel.environment = $6::varchar(32))
+         AND CASE channel.min_level
+               WHEN 'info' THEN 0 WHEN 'warning' THEN 1 ELSE 2
+             END <= CASE $4::varchar(16)
+                      WHEN 'info' THEN 0 WHEN 'warning' THEN 1 ELSE 2
+                    END
+       ON CONFLICT DO NOTHING`,
+      [alert.projectId, alertId, alert.title, alert.level, alert.service,
+        alert.environment, alert.traceId, safePayload],
+    );
   }
 }

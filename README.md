@@ -1,6 +1,6 @@
 # AI 全链路监控平台
 
-基于需求设计文档的 TypeScript 工作区。Phase 1–2 已实现项目/服务/密钥 API、浏览器采集基础、服务端/RAG/LLM Span、Kafka → Collector → ClickHouse，以及读取真实 API 的总览、Trace 检索/执行树和 AI 指标页。告警与项目设置仍是明确标注的演示；生产权限与完整前端事件联查留待 Phase 3，不代表完整 MVP 已交付。现有 `prototype/` 交互原型保留不动。
+基于需求设计文档的 TypeScript 工作区。已实现项目/服务/密钥 API、浏览器采集基础、服务端/RAG/LLM Span、Kafka → Collector → ClickHouse、真实总览/Trace/AI 指标、告警处理，以及项目级 Webhook/Email 通知渠道和持久投递重试。通知渠道使用本机生成的服务端加密密钥；生产登录/RBAC、可编辑规则和多渠道通知增强仍未纳入 MVP。现有 `prototype/` 交互原型保留不动。
 
 项目开发阶段、相对周计划和里程碑见 [AI 全链路监控平台开发排期计划](.agents/Documents/项目计划/AI全链路监控平台-开发排期计划.md)。排期依据需求优先级与架构路线图编制，具体日历日期待项目启动和资源确认后锁定。
 
@@ -16,7 +16,7 @@ packages/
 infra/
   postgres/   项目、服务、密钥、告警和审计表
   clickhouse/ trace_spans 明细表（30 天 TTL）
-compose.yaml  PostgreSQL + Kafka + ClickHouse 本地依赖
+compose.yaml  PostgreSQL + Kafka + ClickHouse + Mailpit 本地依赖
 prototype/    评审用静态原型，独立保留
 ```
 
@@ -38,10 +38,13 @@ pnpm dev
 - PostgreSQL：`localhost:5432`
 - Kafka（本机进程连接）：`localhost:9092`
 - ClickHouse HTTP：<http://localhost:8123>
+- Mailpit 邮件箱：<http://127.0.0.1:8025>（仅本机访问）
 
 启动前请配置本地 `.env` 中的 `PLATFORM_ADMIN_TOKEN`。若 PostgreSQL 使用 `POSTGRES_HOST_PORT=55432`，`DATABASE_URL` 的宿主机端口也应为 55432。若 3001 被其他应用占用，将 `API_PORT` 改为未占用的端口；Vite 代理跟随该配置。建议浏览器访问 `http://127.0.0.1:5173/`，避免其他应用占用 IPv6 localhost 地址。
 
-Compose 只负责本地第三方依赖；API、Collector 和 Web 通过 `pnpm dev` 在宿主机启动。`pnpm infra:up` 会等待 PostgreSQL、Kafka、ClickHouse 的健康检查通过后返回。容器数据保存在 Compose 命名卷中。`pnpm infra:down` 会停止并移除容器，但保留数据卷。
+要启用告警通知渠道，还需在本机 `.env` 里为 `ALERT_NOTIFICATION_ENCRYPTION_KEY` 配置独立的 32 字节 Base64 随机值（可运行 `node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"` 生成），并保持在服务端环境、不要提交。Email 默认连本地 Mailpit SMTP；SMTP 主机、端口和发件地址可通过 `.env` 的 `SMTP_*` 配置覆盖。修改 `.env` 后重启 API。
+
+Compose 只负责本地第三方依赖；API、Collector 和 Web 通过 `pnpm dev` 在宿主机启动。`pnpm infra:up` 会等待 PostgreSQL、Kafka、ClickHouse 的健康检查通过后返回。Mailpit 捕获本机测试邮件；SMTP `127.0.0.1:1025` 和界面 `127.0.0.1:8025` 均只绑定 loopback。容器数据保存在 Compose 命名卷中。`pnpm infra:down` 会停止并移除容器，但保留数据卷。
 
 PostgreSQL 与 ClickHouse 初始化 SQL 只会在各自数据卷首次为空时执行。后续表结构变更应使用版本化迁移，不要依赖重建数据库来应用迁移。
 
@@ -51,13 +54,13 @@ PostgreSQL 与 ClickHouse 初始化 SQL 只会在各自数据卷首次为空时�
 pnpm dev          # 并行启动 Web、API、Collector
 pnpm build        # 构建所有工作区
 pnpm typecheck    # TypeScript 类型检查
-pnpm infra:up     # 启动 PostgreSQL、Kafka、ClickHouse
+pnpm infra:up     # 启动 PostgreSQL、Kafka、ClickHouse、Mailpit
 pnpm infra:down   # 停止并移除容器（保留数据卷）
 ```
 
 ## 当前边界
 
-总览、Trace 列表/详情与 AI 指标页从 API 读取，不在 API 出错时回退成 mock。告警、项目设置仍是明确标注的演示页面，确认/关闭和设置开关仅改变本地状态。项目密钥仅保存 Hash；Span API 认证后写入项目/环境/schema 元数据。Collector 写库成功后才提交 offset，无效消息仅保留固定安全分类；当前为至少一次投递，尚无跨重投的全局去重保证，也未实现持久化 DLQ。Prompt、Response、用户原文默认不采集。
+总览、Trace、AI 指标、告警中心及告警通知渠道从 API 读取；渠道 Webhook 目标和 Email 地址使用 AES-256-GCM 加密后保存，SMTP 密码只在服务端进程环境中配置。告警新事件与匹配通知任务在同一 PostgreSQL 事务内落库，由 API worker 异步投递，Collector 不连接外部目标；投递提供有限自动退避与失败后人工重试。外部投递为至少一次语义，接收方可使用稳定投递 ID 去重。Webhook 默认只允许 HTTPS 且拒绝解析到私有/保留地址的目标；仅隔离本地验收可临时启用私有目标。生产登录/RBAC、可编辑规则与上线容量目标仍待后续 Phase 3 工作。项目密钥仅保存 Hash；Prompt、Response、用户原文默认不采集。
 
 浏览器 SDK 默认无网络 sink；`sdk-test.html` 的“上报到本地平台”也默认关闭。显式开启时，浏览器将脱敏事件转换为 Span，再由同源本地 relay 严格校验并转发。`SDK_TEST_PROJECT_KEY` 只配置在 Vite 服务端进程，不使用 `VITE_*` 或浏览器存储；relay 仅允许本机同源请求、固定服务 `web-sdk-demo` 与环境 `dev`，缺少密钥时关闭转发。该验收 relay 不是生产接入网关，生产应由接入应用自己的可信 BFF 完成认证、限流和服务绑定。
 
@@ -95,7 +98,7 @@ Compose 中的凭证仅供绑定到 localhost 的个人开发环境使用；不�
 
 总览、最新 Trace、Trace 检索/详情执行树、模型用量和 RAG 指标已接真实接口。全局项目、环境和时间范围切换会取消旧请求；空数据、加载和失败重试明确显示，不回退成演示数据。详情提示查询窗口、孤儿/环、多根及 2,000 Span 截断；未观测到的 usage/TTFT 显示“—”。保持原有浅暖白页面样式。
 
-本地 Web 通过 Vite 服务端读取 `PLATFORM_ADMIN_TOKEN`，只代理同源、loopback、合法参数的管理 GET 查询；不要放入 `VITE_*`、URL 或浏览器存储。修改 `.env` 后重启 Web。该代理不用于 preview/生产，也不替代正式登录和项目成员 RBAC。告警、项目设置仍为演示；价格、评估、通知能力留待后续阶段。
+本地 Web 通过 Vite 服务端读取 `PLATFORM_ADMIN_TOKEN`，仅转发严格白名单中的同源、loopback 管理查询和告警通知操作；不要放入 `VITE_*`、URL 或浏览器存储。修改 `.env` 后重启 Web。该代理不用于 preview/生产，也不替代正式登录和项目成员 RBAC。告警通知及投递历史已接真实 API；其余演示设置、价格、评估与生产权限仍需后续实现。
 
 本地端到端验收先运行 `pnpm build`，启动 Compose，然后设置 `$env:TRACE_OPS_RUN_INTEGRATION='1'` 并运行 `node scripts/w18-page-acceptance-session.cjs`（保持终端开启）。脚本输出随机 `webUrl`；另一个终端使用 Playwright CLI 打开该 URL，再运行 `scripts/w18-browser-acceptance.js`。将 CLI 返回的 Result JSON 保存为 `output/acceptance/w18-browser-result.json`，回到验收终端输入 `verify`，继续回查入库结果并自动清理。未完成时输入 `finish`，报告失败并清理；30 分钟超时也会清理。请串行运行，不同时启动多个 W18 验收会话。
 

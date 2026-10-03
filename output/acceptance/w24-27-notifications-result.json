@@ -1,0 +1,21 @@
+{
+  "status": "passed",
+  "cleanup": "passed",
+  "checks": [
+    "authenticated, project-scoped channel API and encrypted/masked targets",
+    "asynchronous webhook and real SMTP-to-Mailpit test delivery",
+    "bounded retry, project isolation, and deleted-channel retry rejection",
+    "incident/outbox transaction, sanitized payload, and duplicate Span idempotency",
+    "durable queued delivery recovered and sent after API process restart",
+    "failed UI retry fixture prepared",
+    "precise cleanup of uniquely addressed acceptance emails"
+  ],
+  "lastObservedDelivery": {
+    "status": "failed",
+    "attemptCount": 1,
+    "lastErrorCode": "webhook_http_error"
+  },
+  "cleanupFailures": [],
+  "noSensitiveProcessOutput": true,
+  "workerDiagnostics": []
+}

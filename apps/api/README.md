@@ -1,6 +1,6 @@
 # API 服务
 
-NestJS API 监听 `API_PORT`（默认 `3001`），路由前缀为 `/api/v1`。当前包含健康检查、项目/服务/密钥与 Span 接入 API、Trace 查询、去重总览及 AI 指标，并提供服务端/RAG/LLM 埋点。控制台总览、Trace 和 AI 页面已接真实接口；告警、设置写操作、生产 RBAC 与前端事件完整联查仍待 Phase 3。
+NestJS API 监听 `API_PORT`（默认 `3001`），路由前缀为 `/api/v1`。当前包含健康检查、项目/服务/密钥与 Span 接入 API、Trace 查询、去重总览及 AI 指标，并提供服务端/RAG/LLM 埋点、告警处理和告警通知渠道。通知地址加密存储，持久投递 worker 与 Collector 解耦。生产登录/RBAC、设置写操作和前端事件完整联查仍待 Phase 3 后续工作。
 
 ## 本地配置
 
@@ -22,7 +22,7 @@ HTTP 202 的 `delivery: "queued_in_memory"` 仅表示数据进入有界内存队
 
 所有项目、服务、环境、密钥和 Overview 路由均要求管理员令牌。Overview 当前只读 ClickHouse 与项目/服务元数据；它不返回错误原文或 Span `attributes`。
 
-该令牌是平台级管理凭证，只能由可信服务端持有。Web 浏览器不得直接持有该令牌，也不能把令牌放进 `VITE_*` 配置。当前本地 Vite 服务端代理仅为项目列表、旧 Overview、新指标与 Trace 列表/详情白名单的合法 GET 注入令牌，不代理项目/服务/密钥写操作；生产部署仍需可信反向代理/BFF 或正式的用户身份与权限方案。
+该令牌是平台级管理凭证，只能由可信服务端持有。Web 浏览器不得直接持有该令牌，也不能把令牌放进 `VITE_*` 配置。当前本地 Vite 服务端代理按路径、方法、查询与 JSON 字段白名单转发管理请求：允许项目/Overview/指标/Trace/告警读取，以及告警状态更新和告警通知渠道/重试操作；不代理项目、服务或密钥写操作。生产部署仍需可信反向代理/BFF 或正式的用户身份与权限方案。
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
@@ -157,4 +157,24 @@ Collector 对每个通过 Span Schema 校验的消息执行四条固定规则：
 
 旧版 `alert_items.status='muted'` 不迁移到新告警 API：旧记录缺少 environment/service/built-in rule 等字段，且 muted 表示静默通知而非 resolved。旧 `alert_items` 数据原样保留，新接口只读取具备完整范围字段的 `alert_incidents`，避免把静默状态伪装为已解决。
 
+## W24–W27：告警通知渠道与持久投递
+
+所有下列接口同样由 `AdminTokenGuard` 保护。渠道和投递记录均按项目隔离；渠道查询只返回掩码后的 `destinationHint` 与 `hasSecret`，不回传加密值或明文目标。渠道名称在同一项目内不区分大小写且不可重复。
+
+- `GET /api/v1/alerts/channels?projectId=<uuid>`：返回 `{items}`，包含 Webhook/Email 类型、环境范围、最低级别、启用状态和目标摘要。
+- `POST /api/v1/alerts/channels`：创建渠道。Webhook body 使用 `type=webhook,webhookUrl`；Email 使用 `type=email,recipient`；共同字段为 `projectId,name,environment,minLevel,enabled`。目标在 API 内使用 `ALERT_NOTIFICATION_ENCRYPTION_KEY`（32 字节 Base64）经 AES-256-GCM 加密后写入 PostgreSQL。密钥缺失/格式错误时创建和修改操作失败关闭。
+- `PATCH /api/v1/alerts/channels/:id`：只更新提供的字段；渠道类型固定，Webhook URL 或 Email 地址留空表示保留现有值。
+- `DELETE /api/v1/alerts/channels/:id?projectId=<uuid>`：软删除渠道并取消尚未完成的投递，保留历史记录。已在外部网络发送中的任务无法撤销。
+- `POST /api/v1/alerts/channels/:id/test`，body `{projectId}`：只把测试任务入队，返回 `{queued:true}`，不等待网络发送。
+- `GET /api/v1/alerts/deliveries?projectId=<uuid>&status=<all|queued|sending|retrying|sent|failed|canceled>&page=1&pageSize=20`：分页查看送达状态与固定错误码，不回显目标和 SMTP/Webhook 响应正文。
+- `POST /api/v1/alerts/deliveries/:id/retry`，body `{projectId}`：仅可人工重试最终失败记录，每条记录最多人工重试 3 次。
+
+Collector 在创建新的告警事件的同一 PostgreSQL 事务内，为当前匹配渠道写入通知 outbox；已有未解决事件只增加触发数，不重复入队。Collector 不访问邮件或 Webhook。API worker 使用 `FOR UPDATE SKIP LOCKED` 抢占待发送记录、维护 30 秒租约、回收过期任务；自动尝试最多 5 次，退避为 15 秒、1 分钟、5 分钟、15 分钟、30 分钟。Worker 崩溃或数据库确认前崩溃可由租约恢复；外部服务已接受而本地未记录成功时可能重复投递，因此 Webhook 请求同时附带稳定 `Idempotency-Key` 和 `X-Trace-Ops-Delivery-ID`，接收端应按该 ID 去重。
+
+Webhook 默认限定 HTTPS，API 对 DNS 解析结果校验公网地址并固定本次连接 IP，不跟随 3xx；私有地址拒绝投递。`ALERT_NOTIFICATIONS_ALLOW_PRIVATE_TARGETS=true` 只在 `NODE_ENV=development` 或 `test` 时生效，用于隔离的本地 HTTP receiver 验收；生产环境即使误配置为 true 也会忽略。Email 使用 `SMTP_HOST/PORT/SECURE/FROM/USER/PASSWORD` 服务端配置；本地 Compose 提供 Mailpit，SMTP 绑定 `127.0.0.1:1025`，网页界面绑定 `127.0.0.1:8025`。邮件和 Webhook 只含告警 ID、标题、规则、级别、服务、环境、Trace ID 等元数据，不含 Prompt/Response、原始异常或任意 Span attributes。错误详情统一收敛成固定分类码，禁止记录外部响应体、收件地址和目标 URL。
+
+版本迁移 `infra/postgres/init/003-alert-notifications.sql` 与 `002-alerts.sql` 一样，会在 API 与 Collector 启动时持同一个 PostgreSQL advisory lock 幂等执行，因此已有 Compose 数据卷无需删除或重建。
+
 回归验证：`pnpm --filter @trace-ops/api test` 和 `node --test apps/collector/tests/*.test.mjs`。PostgreSQL 端到端幂等/状态测试默认跳过；PowerShell 中可从仓库根目录设置 `$env:TRACE_OPS_RUN_ALERTS_INTEGRATION='1'` 后运行 `node --env-file=.env --test apps/api/tests/alerts-postgres.integration.test.mjs`，完成后用 `Remove-Item Env:TRACE_OPS_RUN_ALERTS_INTEGRATION` 清除本次开关。该用例创建随机命名临时项目，并在结束时验证删除本次项目及级联数据。
+
+W24–W27 本机通知验收需要先启动 Compose Mailpit，再执行 `pnpm build`；PowerShell 中设置 `$env:TRACE_OPS_RUN_NOTIFICATIONS_INTEGRATION='1'` 并运行 `node --env-file=.env scripts/w24-27-notifications-acceptance.cjs`。脚本只接受 loopback PostgreSQL 与 `127.0.0.1:8025` Mailpit，使用临时加密密钥和独立项目/收件人，测试完成后清理；它会启动隔离 API/Web 并等待浏览器验收，在浏览器测完后向该命令输入 `finish` 触发清理。JSON 验收摘要写入 `output/acceptance/w24-27-notifications-result.json`，临时浏览器入口写入 `w24-27-notifications-session.json`。不要启用或提交 `.env` 中的真实 SMTP 凭证。

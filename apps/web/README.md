@@ -139,9 +139,9 @@ Relay 只接受无 query/hash 的同源 endpoint，验收页固定使用 `POST /
 
 ## 控制台真实数据链路（Phase 2 W18–W20）
 
-运行仓库根目录的 `pnpm dev` 时，总览、Trace 检索/详情和 AI 链路页读取真实 API 数据，包括 `/api/v1/projects`、`/api/v1/metrics/overview`、`/api/v1/metrics/ai`、`/api/v1/traces` 及单条 Trace 详情。前端只走同源 `/api`；Vite 开发服务器仅为严格白名单内的只读 GET 路由从进程环境中的 `PLATFORM_ADMIN_TOKEN` 注入 Bearer 令牌，并校验查询参数。令牌不进入浏览器 Bundle、`VITE_*` 配置或存储。未配置令牌或 API 不可用时显示明确错误，不回退为假实时数据。
+运行仓库根目录的 `pnpm dev` 时，总览、Trace 检索/详情、AI 链路和告警通知页读取真实 API 数据，包括 `/api/v1/projects`、`/api/v1/metrics/*`、`/api/v1/traces` 与 `/api/v1/alerts/*`。前端只走同源 `/api`；Vite 开发服务器从进程环境读取 `PLATFORM_ADMIN_TOKEN`，按路由、HTTP 方法、参数和 JSON 字段白名单转发这些管理请求，并在服务端注入 Bearer 令牌。令牌不进入浏览器 Bundle、`VITE_*` 配置或存储。未配置令牌或 API 不可用时显示明确错误，不回退为假实时数据。
 
-此 Vite 代理仅用于本地开发。生产控制台必须配置可信的服务端反向代理/BFF 或用户登录与权限体系，不能把管理员令牌发给浏览器。总览“最新 Traces”、Trace 检索/详情及 AI 指标已经接入真实数据；告警中心和项目设置仍为明确标注的演示页面，不执行真实配置写入。前端事件联合查询及生产权限闭环留在 Phase 3。
+此 Vite 代理仅用于本地开发。生产控制台必须配置可信的服务端反向代理/BFF 或用户登录与权限体系，不能把管理员令牌发给浏览器。总览“最新 Traces”、Trace 检索/详情、AI 指标、告警中心及项目设置中的告警通知均接入真实 API。通知界面支持项目级 Webhook/Email 渠道、测试投递、投递状态筛选和失败后人工重试；原始目标只在提交时进入同源代理，请求结束后不回显或持久化在浏览器。项目其他演示配置仍不执行真实写入，前端事件联合查询及生产权限闭环留在 Phase 3。
 
 开发代理跟随进程环境中的 `API_PORT`（默认 3001）。若该端口被其他项目占用，可在根目录 `.env` 中设置其他端口后重启 `pnpm dev`；API 与前端代理会使用相同端口。请用 `http://127.0.0.1:5173/` 访问，避免 `localhost` 解析到其他应用占用的 IPv6 监听地址。
 

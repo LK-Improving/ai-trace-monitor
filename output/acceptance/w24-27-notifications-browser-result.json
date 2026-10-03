@@ -1,0 +1,11 @@
+{
+  "status": "passed",
+  "checks": [
+    "settings navigation correctly labels notifications as live API data",
+    "project-scoped notification channels render and test delivery is visible",
+    "failed delivery can be retried from the browser and reaches sent",
+    "same-origin server proxy keeps administrator authorization server-side",
+    "notification history fits the narrow mobile viewport"
+  ],
+  "screenshotPath": "D:\\Study\\重点项目\\AI\\ai-trace-monitor\\output\\playwright\\w24-27-notifications.png"
+}

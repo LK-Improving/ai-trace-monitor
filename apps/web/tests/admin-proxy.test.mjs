@@ -5,6 +5,7 @@ import {
   createAdminProxy,
   inspectAdminRequestTarget,
   validateAdminQuery,
+  validateAlertChannelBody,
   validateAlertStateBody,
   validateLocalSameOrigin,
 } from '../src/admin-proxy-runtime.mjs';
@@ -317,6 +318,67 @@ test('alert list and summary query validators accept only the shared contract fi
     `projectId=${projectId}&environment=dev&debug=true`,
   ]) assert.equal(validateAdminQuery(list, query).valid, false, query);
   assert.equal(validateAdminQuery(summary, `projectId=${projectId}&environment=all&state=active`).valid, false);
+});
+
+test('notification proxy recognizes only exact scoped routes and contract-shaped inputs', () => {
+  const channels = routeFor('/api/v1/alerts/channels');
+  const channel = routeFor(`/api/v1/alerts/channels/${projectId}`);
+  const deliveries = routeFor('/api/v1/alerts/deliveries');
+  assert.equal(channels.name, 'alertChannels');
+  assert.equal(channel.name, 'alertChannel');
+  assert.equal(validateAdminQuery(channels, `projectId=${projectId}`, 'GET').valid, true);
+  assert.equal(validateAdminQuery(channels, '', 'POST').valid, true);
+  assert.equal(validateAdminQuery(channel, `projectId=${projectId}`, 'DELETE').valid, true);
+  assert.equal(validateAdminQuery(deliveries,
+    `projectId=${projectId}&status=failed&page=2&pageSize=20`).valid, true);
+  assert.equal(validateAdminQuery(deliveries,
+    `projectId=${projectId}&status=all&page=1&pageSize=20&debug=1`).valid, false);
+
+  const createBody = JSON.stringify({
+    projectId, name: 'primary', type: 'webhook', environment: 'prod', minLevel: 'warning',
+    enabled: true, webhookUrl: 'https://hooks.example.test/alerts',
+  });
+  assert.equal(validateAlertChannelBody(createBody, 'create').valid, true);
+  assert.equal(validateAlertChannelBody(createBody.replace('https://', 'http://'), 'create').valid, true,
+    'private-target opt-in is enforced by the API sender, never by the browser proxy');
+  assert.equal(validateAlertChannelBody(createBody.replace('"enabled":true', '"enabled":true,"secret":"canary"'), 'create').valid, undefined);
+  assert.equal(validateAlertChannelBody(JSON.stringify({ projectId, enabled: false, type: 'email' }), 'patch').valid, undefined,
+    'channel type cannot be changed after creation');
+  assert.equal(validateAlertChannelBody(JSON.stringify({ projectId, recipient: 'oncall@example.test' }), 'patch').valid, true);
+
+  for (const path of [
+    `/api/v1/alerts/channels/${projectId}/test/extra`,
+    `/api/v1/alerts/deliveries/${projectId}/retry/extra`,
+    '/api/v1/alerts/channels/not-a-uuid',
+  ]) assert.equal(inspectAdminRequestTarget(path)?.valid, false, path);
+});
+
+test('notification channel mutations forward only validated JSON and the server-owned admin token', async () => {
+  const beforeCount = upstreamRequests.length;
+  const body = JSON.stringify({
+    projectId, name: 'primary', type: 'webhook', environment: 'prod', minLevel: 'warning',
+    enabled: true, webhookUrl: 'https://hooks.example.test/alerts',
+  });
+  const response = await get('/api/v1/alerts/channels', {
+    method: 'POST',
+    headers: { ...localHeaders(), 'content-type': 'application/json', authorization: 'Bearer browser-controlled-token' },
+    body,
+  });
+  assert.equal(response.status, 200);
+  const forwarded = upstreamRequests.at(-1);
+  assert.equal(upstreamRequests.length, beforeCount + 1);
+  assert.equal(forwarded.method, 'POST');
+  assert.equal(forwarded.authorization, `Bearer ${testToken}`);
+  assert.equal(forwarded.clientAuthorization, undefined);
+  assert.equal(JSON.parse(forwarded.body).webhookUrl, 'https://hooks.example.test/alerts');
+
+  const invalid = await get(`/api/v1/alerts/channels/${projectId}`, {
+    method: 'PATCH',
+    headers: { ...localHeaders(), 'content-type': 'application/json' },
+    body: JSON.stringify({ projectId, type: 'email' }),
+  });
+  assert.equal(invalid.status, 400);
+  assert.equal(upstreamRequests.length, beforeCount + 1);
 });
 
 test('alert state body accepts one literal enum field and rejects duplicates or extra JSON keys', () => {

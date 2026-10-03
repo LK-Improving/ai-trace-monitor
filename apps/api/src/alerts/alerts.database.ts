@@ -13,15 +13,24 @@ const ALERT_SCHEMA_LOCK_ID = '7321198204142';
 
 function alertSchemaSql(): string {
   const configuredPath = process.env.TRACE_OPS_ALERT_SCHEMA_PATH;
-  const candidates = [
-    ...(configuredPath ? [resolve(configuredPath)] : []),
-    resolve(process.cwd(), 'infra/postgres/init/002-alerts.sql'),
-    resolve(process.cwd(), '../../infra/postgres/init/002-alerts.sql'),
-    resolve(__dirname, '../../../../infra/postgres/init/002-alerts.sql'),
+  if (configuredPath) {
+    const path = resolve(configuredPath);
+    if (!existsSync(path)) throw new Error('Alert schema migration file is unavailable');
+    return readFileSync(path, 'utf8');
+  }
+  const roots = [
+    process.cwd(),
+    resolve(process.cwd(), '../..'),
+    resolve(__dirname, '../../../../'),
   ];
-  const path = candidates.find((candidate) => existsSync(candidate));
-  if (!path) throw new Error('Alert schema migration file is unavailable');
-  return readFileSync(path, 'utf8');
+  for (const root of roots) {
+    const paths = [
+      resolve(root, 'infra/postgres/init/002-alerts.sql'),
+      resolve(root, 'infra/postgres/init/003-alert-notifications.sql'),
+    ];
+    if (paths.every(existsSync)) return paths.map((path) => readFileSync(path, 'utf8')).join('\n');
+  }
+  throw new Error('Alert schema migration files are unavailable');
 }
 
 @Injectable()
@@ -57,8 +66,8 @@ export class AlertsDatabase implements OnModuleInit, OnModuleDestroy {
   ): Promise<QueryResult<T>> {
     try {
       return await this.pool.query<T>(text, values as unknown[]);
-    } catch {
-      throw new Error('Alert storage query failed');
+    } catch (error) {
+      throw new Error('Alert storage query failed', { cause: error });
     }
   }
 

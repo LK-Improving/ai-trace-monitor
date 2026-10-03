@@ -92,6 +92,13 @@ services:
       timeout: 5s
       retries: 20
 
+  mailpit:
+    image: axllent/mailpit:v1.27.4
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+
 volumes:
   postgres-data:
   kafka-data:
