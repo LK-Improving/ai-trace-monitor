@@ -11,6 +11,7 @@ const MAX_PROJECT_KEY_BODY_BYTES = 4096;
 const MAX_PROJECT_PRIVACY_BODY_BYTES = 32 * 1024;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TRACE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const PARENT_SPAN_ID_PATTERN = /^[a-f0-9]{32}$/;
 const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 const ENVIRONMENTS = new Set(['dev', 'staging', 'prod']);
 const OVERVIEW_ENVIRONMENTS = new Set(['dev', 'staging', 'prod', 'all']);
@@ -639,6 +640,12 @@ function rawHeaderValues(request, name) {
   return value === undefined ? values : [String(value)];
 }
 
+function validatedTraceContextHeader(request, name, pattern) {
+  const values = rawHeaderValues(request, name);
+  if (values.length !== 1 || !pattern.test(values[0])) return undefined;
+  return values[0];
+}
+
 function oneHeader(request, name) {
   const values = rawHeaderValues(request, name);
   if (values.length > 1) return { valid: false, present: true };
@@ -843,6 +850,10 @@ function proxyValidatedRequest(request, response, options, route, search, method
     ? options.maxResponseBytes
     : DEFAULT_MAX_RESPONSE_BYTES;
   const upstreamPath = `${route.path}${search ? `?${search}` : ''}`;
+  const traceId = validatedTraceContextHeader(request, 'x-trace-id', TRACE_ID_PATTERN);
+  const parentSpanId = traceId
+    ? validatedTraceContextHeader(request, 'x-parent-span-id', PARENT_SPAN_ID_PATTERN)
+    : undefined;
 
   try {
     upstreamRequest = httpRequest({
@@ -854,6 +865,8 @@ function proxyValidatedRequest(request, response, options, route, search, method
       headers: {
         Authorization: `Bearer ${token}`,
         Accept: 'application/json',
+        ...(traceId ? { 'x-trace-id': traceId } : {}),
+        ...(parentSpanId ? { 'x-parent-span-id': parentSpanId } : {}),
         ...(body === undefined ? {} : {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(body),

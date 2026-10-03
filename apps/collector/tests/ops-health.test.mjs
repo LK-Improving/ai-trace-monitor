@@ -15,6 +15,7 @@ const {
   OPS_HEALTH_PORT,
   createOpsHealthServer,
   listenOpsHealthServer,
+  resolveOpsHealthPort,
 } = require('../dist/ops-health.js');
 
 function createClock() {
@@ -150,7 +151,12 @@ test('batch and ClickHouse instrumentation count only observed events and never 
 
 test('health HTTP exposes only GET on the fixed path and returns a safe snapshot', async (t) => {
   assert.equal(OPS_HEALTH_BIND_HOST, '127.0.0.1');
-  assert.equal(OPS_HEALTH_PORT, 3011);
+  assert.equal(resolveOpsHealthPort(undefined), 3011);
+  assert.equal(OPS_HEALTH_PORT, resolveOpsHealthPort());
+  assert.equal(resolveOpsHealthPort('3012'), 3012);
+  for (const value of ['', '0', '-1', '65536', '3011x', '100000']) {
+    assert.throws(() => resolveOpsHealthPort(value), TypeError);
+  }
   assert.equal(OPS_HEALTH_PATH, '/internal/ops/health');
   const telemetry = new CollectorTelemetry('health-topic', 'health-group');
   const server = createOpsHealthServer(telemetry);
@@ -191,8 +197,10 @@ test('health HTTP exposes only GET on the fixed path and returns a safe snapshot
   assert.deepEqual(await pathResponse.json(), { error: 'not_found' });
 });
 
-test('production health listener can only bind the fixed loopback address and port', () => {
+test('health listener defaults to the fixed loopback port and supports a validated isolated port', () => {
   const calls = [];
   listenOpsHealthServer({ listen: (...args) => calls.push(args) });
   assert.deepEqual(calls, [[3011, '127.0.0.1']]);
+  listenOpsHealthServer({ listen: (...args) => calls.push(args) }, 3012);
+  assert.deepEqual(calls[1], [3012, '127.0.0.1']);
 });

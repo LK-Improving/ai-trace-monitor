@@ -75,6 +75,10 @@ function localHeaders(site = 'same-origin', origin) {
   };
 }
 
+function localContextHeaders(extra = {}) {
+  return { ...localHeaders(), ...extra };
+}
+
 function boundaryRequest(options = {}) {
   const host = options.host ?? '127.0.0.1:5173';
   const origin = Object.hasOwn(options, 'origin') ? options.origin : 'http://127.0.0.1:5173';
@@ -114,6 +118,8 @@ before(async () => {
         authorization: request.headers.authorization,
         clientAuthorization: request.headers['x-client-authorization'],
         contentType: request.headers['content-type'],
+        ...(request.headers['x-trace-id'] === undefined ? {} : { traceId: request.headers['x-trace-id'] }),
+        ...(request.headers['x-parent-span-id'] === undefined ? {} : { parentSpanId: request.headers['x-parent-span-id'] }),
         body: Buffer.concat(chunks).toString('utf8'),
       });
       response.statusCode = upstreamMode.status;
@@ -563,6 +569,57 @@ test('middleware forwards only validated allowlisted GETs with the server token'
     assert.equal(request.body, '');
   }
   for (let index = 0; index < cases.length; index++) assert.equal(forwarded[index].url, cases[index][1]);
+});
+
+test('proxy forwards only valid singleton Trace context and drops ambiguous headers without exposing browser credentials', async () => {
+  const traceId = 'trace_web_browser-navigation-1';
+  const parentSpanId = 'a'.repeat(32);
+  const valid = await get('/api/v1/ops/health', {
+    headers: localContextHeaders({
+      'x-trace-id': traceId,
+      'x-parent-span-id': parentSpanId,
+      authorization: 'Bearer browser-controlled-secret',
+      cookie: 'session=browser-controlled-secret',
+      'x-untrusted-header': 'must-not-forward',
+    }),
+  });
+  assert.equal(valid.status, 200, JSON.stringify(valid));
+  const forwardedValid = upstreamRequests.at(-1);
+  assert.equal(forwardedValid.traceId, traceId);
+  assert.equal(forwardedValid.parentSpanId, parentSpanId);
+  assert.equal(forwardedValid.authorization, `Bearer ${testToken}`);
+  assert.equal(forwardedValid.clientAuthorization, undefined);
+  assert.equal(forwardedValid.cookie, undefined);
+  assert.equal(forwardedValid.untrustedHeader, undefined);
+
+  const invalidCases = [
+    {
+      name: 'duplicate parent',
+      headers: { 'x-trace-id': traceId, 'x-parent-span-id': [parentSpanId, 'b'.repeat(32)] },
+      trace: traceId,
+    },
+    {
+      name: 'malformed parent',
+      headers: { 'x-trace-id': traceId, 'x-parent-span-id': 'not-a-32-char-lowercase-hex-span' },
+      trace: traceId,
+    },
+    {
+      name: 'duplicate trace',
+      headers: { 'x-trace-id': [traceId, 'trace_web_second'] },
+    },
+    {
+      name: 'malformed trace',
+      headers: { 'x-trace-id': 'contains spaces', 'x-parent-span-id': parentSpanId },
+    },
+  ];
+  for (const entry of invalidCases) {
+    const response = await get('/api/v1/ops/health', { headers: localContextHeaders(entry.headers) });
+    assert.equal(response.status, 200, entry.name);
+    const forwarded = upstreamRequests.at(-1);
+    assert.equal(forwarded.traceId, entry.trace, entry.name);
+    assert.equal(forwarded.parentSpanId, undefined, entry.name);
+    assert.equal(forwarded.authorization, `Bearer ${testToken}`, entry.name);
+  }
 });
 
 test('platform operations proxy rejects filters, bodies, and non-GET methods before forwarding', async () => {

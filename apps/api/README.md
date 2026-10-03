@@ -1,12 +1,14 @@
 # API 服务
 
-NestJS API 监听 `API_PORT`（默认 `3001`），路由前缀为 `/api/v1`。当前包含健康检查、项目/服务/密钥与 Span 接入 API、Trace 查询、去重总览及 AI 指标，并提供服务端/RAG/LLM 埋点、告警处理和告警通知渠道。通知地址加密存储，持久投递 worker 与 Collector 解耦。生产登录/RBAC、设置写操作和前端事件完整联查仍待 Phase 3 后续工作。
+NestJS API 监听 `API_PORT`（默认 `3001`），路由前缀为 `/api/v1`。当前包含健康检查、项目/服务/密钥与 Span 接入 API、Trace 查询、去重总览及 AI 指标，并提供服务端/RAG/LLM 埋点、告警处理和告警通知渠道。通知地址加密存储，持久投递 worker 与 Collector 解耦。生产登录/RBAC、项目方 Staging 试点与验收、生产发布回滚演练仍待后续完成。
 
 ## 本地配置
 
 1. 复制仓库根目录 `.env.example` 为本地 `.env`，配置 PostgreSQL `DATABASE_URL`。
 2. 为 `PLATFORM_ADMIN_TOKEN` 设置本机生成的高熵随机值；该变量留空或未配置时，管理 API 会拒绝所有请求（fail closed）。不要把它放进 Web 环境变量、浏览器代码、请求 URL 或日志，也不要提交真实值。
 3. 启动 API：`pnpm --filter @trace-ops/api dev`。
+
+平台运维页默认从 `127.0.0.1:3011/internal/ops/health` 探测 Collector。隔离测试或本机端口冲突时，可在 API 与 Collector 进程中同时设置 `COLLECTOR_OPS_HEALTH_PORT`（默认 `3011`）；Collector 仅绑定 loopback，端口值必须是 `1–65535` 的整数。
 
 `GET /api/v1/health` 不要求管理员令牌。管理路由使用 `Authorization: Bearer <PLATFORM_ADMIN_TOKEN>`。响应统一使用 `{ "statusCode": number, "error": string, "message": string | string[] }` 错误结构；预期状态包括 400（输入无效）、401（令牌缺失/错误）、404（项目或密钥不存在）、409（唯一键冲突）和 503（PostgreSQL 不可用）。
 
@@ -44,6 +46,8 @@ Overview 的全局请求量、错误数、P95 与趋势按根 Span（`parent_spa
 
 API 接收单个符合 W1 格式的 `x-trace-id` 时沿用该值；缺失、格式无效或重复/歧义时生成 `trace_v1_<UUID>`。请求 Body 不参与 Trace ID 解析。中间件会在路由执行前设置响应头，因此成功和异常响应都会带 `x-trace-id`；CORS 同时暴露该响应头。
 
+可选 `x-parent-span-id` 仅在 `x-trace-id` 同时唯一且有效时接受，且只允许 32 位小写十六进制值；服务端将它作为 `http.server` Span 的 `parentSpanId`，不放入 attributes。Trace ID 缺失、无效或重复时，API 仍生成新 ID 并忽略 parent。跨服务代理/BFF 必须显式白名单透传这两个 Header；不要把它们用于身份或权限判断。
+
 ## W9–W11 服务端链路记录
 
 下列周阶段小节保留开发时点说明；当前查询能力和页面状态以本文开头及 W18–W20 控制台文档为准。
@@ -59,7 +63,7 @@ SERVER_TRACE_ENVIRONMENT=dev
 
 这些值只能来自可信服务端配置，不能从请求 body、租户 header 或浏览器 `VITE_*` 配置取得。启动时进行一次限时注册校验；配置错误、未注册或 PostgreSQL 不可用时停用埋点，不阻止 API 启动。`GET /api/v1/health` 的 `tracing.state` 显示 `disabled / ready / invalid_configuration / unregistered_binding / dependency_unavailable`；修复配置或注册后需要重启。运行期注册状态变更暂不热更新，正式多租户接入需在可信网关实时鉴权，此静态绑定不是客户端上报鉴权的替代。
 
-启用后，经过 NestJS 拦截器的请求产生 `http.server` 根 Span，继承 middleware 解析的 `x-trace-id`，在响应 `finish` 或提前 `close` 时结束并写入现有有界队列。不等待 Kafka 连接、发送或 ClickHouse 写入。健康检查与整个 `/spans` 接入/状态路径排除，避免监控自己的上报造成递归。Nest Guard 拒绝、找不到路由、body parser 提前拒绝发生在拦截器之前，当前只返回 Trace ID，不产生根 Span；此边界不应被误解为覆盖所有入口失败。
+启用后，经过 NestJS 拦截器的请求产生 `http.server` Span，继承 middleware 解析的 `x-trace-id`。如果请求同时带有唯一、有效的 Trace ID 和严格格式的 `x-parent-span-id`，该 parent ID 会作为根 Span 的 `parentSpanId`；parent 缺失、格式错误、重复，或 Trace ID 缺失/无效/重复时均忽略，不写入 Span attributes。Span 在响应 `finish` 或提前 `close` 时结束并写入现有有界队列，不等待 Kafka 连接、发送或 ClickHouse 写入。健康检查与整个 `/spans` 接入/状态路径排除，避免监控自己的上报造成递归。Nest Guard 拒绝、找不到路由、body parser 提前拒绝发生在拦截器之前，当前只返回 Trace ID，不产生根 Span；此边界不应被误解为覆盖所有入口失败。
 
 业务模块导入 `ObservabilityModule` 并注入 `TraceContext`，可自动继承上下文：
 

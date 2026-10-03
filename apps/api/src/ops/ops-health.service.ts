@@ -58,7 +58,8 @@ const KAFKA_SNAPSHOT_TIMEOUT_MS = 4_000;
 const KAFKA_SNAPSHOT_CACHE_MS = 1_000;
 const KAFKA_DISCONNECT_TIMEOUT_MS = 500;
 const COLLECTOR_BODY_MAX_BYTES = 16 * 1024;
-const COLLECTOR_ENDPOINT = 'http://127.0.0.1:3011/internal/ops/health';
+const DEFAULT_COLLECTOR_OPS_HEALTH_PORT = 3011;
+const COLLECTOR_OPS_HEALTH_PATH = '/internal/ops/health';
 const COLLECTOR_FIELDS = [
   'status', 'topic', 'consumerGroup', 'uptimeSeconds', 'processedMessages', 'insertedSpans',
   'invalidMessages', 'failedBatches', 'clickhouseWriteFailures', 'committedBatches',
@@ -68,6 +69,15 @@ const COLLECTOR_FIELDS = [
 function configuredName(value: string | undefined, fallback: string): string {
   const candidate = value?.trim() || fallback;
   return /^[A-Za-z0-9._-]{1,249}$/.test(candidate) ? candidate : fallback;
+}
+
+function collectorHealthEndpoint(config: ConfigService): string | undefined {
+  const value = config.get<string>('COLLECTOR_OPS_HEALTH_PORT');
+  if (value === undefined) return `http://127.0.0.1:${DEFAULT_COLLECTOR_OPS_HEALTH_PORT}${COLLECTOR_OPS_HEALTH_PATH}`;
+  if (!/^[0-9]{1,5}$/.test(value)) return undefined;
+  const port = Number(value);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) return undefined;
+  return `http://127.0.0.1:${port}${COLLECTOR_OPS_HEALTH_PATH}`;
 }
 
 function roundMilliseconds(value: number): number {
@@ -345,10 +355,12 @@ export class OpsHealthService implements OnModuleDestroy {
   }
 
   protected async probeCollector(): Promise<CollectorHealth> {
+    const endpoint = collectorHealthEndpoint(this.config);
+    if (!endpoint) return nullableCollector(this.topic, this.consumerGroup);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
     try {
-      const response = await fetch(COLLECTOR_ENDPOINT, {
+      const response = await fetch(endpoint, {
         method: 'GET',
         headers: { accept: 'application/json' },
         cache: 'no-store',

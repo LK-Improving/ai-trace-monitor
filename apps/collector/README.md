@@ -20,6 +20,7 @@ pnpm --filter @trace-ops/collector start
 | `KAFKA_BROKERS` | `localhost:9092` | Kafka broker 地址，多个地址以逗号分隔 |
 | `KAFKA_TOPIC` | `ai-spans` | 输入 topic |
 | `KAFKA_GROUP_ID` | `trace-ops-collector` | Consumer group |
+| `COLLECTOR_OPS_HEALTH_PORT` | `3011` | 仅绑定 `127.0.0.1` 的健康端口；隔离集成测试可指定临时端口 |
 | `CLICKHOUSE_URL` | `http://localhost:8123` | ClickHouse HTTP endpoint |
 | `CLICKHOUSE_USER` | `trace_ops` | ClickHouse 用户 |
 | `CLICKHOUSE_PASSWORD` | `trace_ops_dev_only` | 本地开发默认密码；不要在生产环境复用 |

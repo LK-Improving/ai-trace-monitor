@@ -2,8 +2,10 @@ import { onCLS, onFCP, onINP, onLCP, onTTFB } from 'web-vitals';
 import type { Metric as WebVitalMetric } from 'web-vitals';
 
 export const TRACE_ID_HEADER = 'x-trace-id';
+export const TRACE_PARENT_SPAN_ID_HEADER = 'x-parent-span-id';
 
 const TRACE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const SPAN_ID_PATTERN = /^[a-f0-9]{32}$/;
 
 export type ProtocolEnvironment = 'dev' | 'staging' | 'prod';
 export type WebVitalName = 'CLS' | 'INP' | 'LCP' | 'FCP' | 'TTFB';
@@ -24,9 +26,15 @@ export interface MonitorEventBase {
   environment: ProtocolEnvironment;
   timestamp: number;
   traceId: string;
+  parentSpanId?: string;
 }
 
 export type BrowserMonitorEvent = MonitorEventBase & (
+  | {
+      type: 'navigation';
+      spanId: string;
+      startTime: number;
+    }
   | {
       type: 'web_vital';
       metric: WebVitalName;
@@ -91,6 +99,21 @@ export function isValidTraceId(value: unknown): value is string {
   return typeof value === 'string' && TRACE_ID_PATTERN.test(value);
 }
 
+export function isValidSpanId(value: unknown): value is string {
+  return typeof value === 'string' && SPAN_ID_PATTERN.test(value);
+}
+
+export function createBrowserSpanId(): string {
+  const cryptoApi = globalThis.crypto;
+  if (cryptoApi && typeof cryptoApi.randomUUID === 'function') {
+    return cryptoApi.randomUUID().replaceAll('-', '').toLowerCase();
+  }
+  if (cryptoApi && typeof cryptoApi.getRandomValues === 'function') {
+    return Array.from(cryptoApi.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  }
+  throw new Error('Web Crypto API is required to create a Span ID');
+}
+
 export function createTraceId(): string {
   const cryptoApi = globalThis.crypto;
 
@@ -146,9 +169,20 @@ export function prepareApiRequest(input: RequestInfo | URL, options: ApiRequestI
   new Headers(requestInit.headers).forEach((value, name) => headers.set(name, value));
 
   const headerTraceId = headers.get(TRACE_ID_HEADER);
-  const inboundTraceId = isValidTraceId(headerTraceId) ? headerTraceId : getPageTraceId();
+  const activePageTraceId = activeOptions?.enabled && hasEventSink(activeOptions) && isSameOrigin(input)
+    ? pageTraceId
+    : undefined;
+  const inboundTraceId = isValidTraceId(headerTraceId) ? headerTraceId : getPageTraceId() ?? activePageTraceId;
   const traceId = resolveTraceId(currentTraceId, inboundTraceId);
   headers.set(TRACE_ID_HEADER, traceId);
+
+  if (isSameOrigin(input)) {
+    const parentSpanId = getActivePageParentSpanId(traceId);
+    if (parentSpanId) headers.set(TRACE_PARENT_SPAN_ID_HEADER, parentSpanId);
+    else if (pageNavigationSpanId && headers.get(TRACE_PARENT_SPAN_ID_HEADER) === pageNavigationSpanId) {
+      headers.delete(TRACE_PARENT_SPAN_ID_HEADER);
+    }
+  }
 
   return {
     input,
@@ -299,6 +333,10 @@ function sameOptions(left: BrowserMonitorOptions, right: BrowserMonitorOptions):
 
 let activeOptions: ReturnType<typeof normalizeOptions> | undefined;
 let pageTraceId: string | undefined;
+let pageNavigationSpanId: string | undefined;
+let pageNavigationEvent: BrowserMonitorEvent | undefined;
+let pageNavigationObserverDelivered = false;
+const pageNavigationTransportSinks = new WeakSet<BrowserMonitorTransport>();
 let webVitalsObserversInstalled = false;
 
 function hasEventSink(options: BrowserMonitorOptions): boolean {
@@ -325,19 +363,79 @@ function deliverEvent(event: BrowserMonitorEvent): void {
   }
 }
 
+function browserNavigationStartTime(fallback: number): number {
+  try {
+    const performanceApi = globalThis.performance;
+    const entry = performanceApi?.getEntriesByType?.('navigation')?.[0];
+    const timeOrigin = performanceApi?.timeOrigin;
+    if (!entry || typeof timeOrigin !== 'number' || !Number.isFinite(entry.startTime)) return fallback;
+    const startTime = Math.floor(timeOrigin + entry.startTime);
+    return Number.isSafeInteger(startTime) && startTime >= 0 && startTime <= fallback ? startTime : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function invokeNavigationSink(
+  sink: BrowserMonitorTransport | NonNullable<BrowserMonitorOptions['onEvent']>,
+  event: BrowserMonitorEvent,
+): void {
+  try {
+    const result = sink(event);
+    if (result && typeof result.then === 'function') void result.catch(() => undefined);
+  } catch {
+    // Navigation telemetry must never change application behavior.
+  }
+}
+
+function ensurePageTraceRoot(options: BrowserMonitorOptions): boolean {
+  if (!activeOptions || !hasEventSink(options)) return false;
+
+  try {
+    pageTraceId ??= resolveTraceId(undefined, getPageTraceId());
+    pageNavigationSpanId ??= createBrowserSpanId();
+  } catch {
+    return false;
+  }
+
+  if (!pageNavigationEvent) {
+    const timestamp = Date.now();
+    pageNavigationEvent = Object.freeze({
+      type: 'navigation',
+      service: options.service,
+      environment: options.environment,
+      timestamp,
+      traceId: pageTraceId,
+      spanId: pageNavigationSpanId,
+      startTime: browserNavigationStartTime(timestamp),
+    });
+  }
+
+  if (options.onEvent && !pageNavigationObserverDelivered) {
+    pageNavigationObserverDelivered = true;
+    invokeNavigationSink(options.onEvent, pageNavigationEvent);
+  }
+  if (options.transport && !pageNavigationTransportSinks.has(options.transport)) {
+    pageNavigationTransportSinks.add(options.transport);
+    invokeNavigationSink(options.transport, pageNavigationEvent);
+  }
+  return true;
+}
+
+function pageEventParentSpanId(traceId: string): string | undefined {
+  return traceId === pageTraceId && isValidSpanId(pageNavigationSpanId) ? pageNavigationSpanId : undefined;
+}
+
+function getActivePageParentSpanId(traceId: string): string | undefined {
+  if (!activeOptions?.enabled || !activeOptions.transport) return undefined;
+  return pageEventParentSpanId(traceId);
+}
+
 function emitWithPageTrace(
   options: BrowserMonitorOptions,
   event: BrowserMonitorEventPayload,
 ): void {
-  if (!activeOptions || !hasEventSink(options)) return;
-
-  if (!pageTraceId) {
-    try {
-      pageTraceId = resolveTraceId(undefined, getPageTraceId());
-    } catch {
-      return;
-    }
-  }
+  if (!ensurePageTraceRoot(options) || !pageTraceId) return;
 
   deliverEvent({
     ...event,
@@ -345,6 +443,7 @@ function emitWithPageTrace(
     environment: options.environment,
     timestamp: Date.now(),
     traceId: pageTraceId,
+    ...(pageEventParentSpanId(pageTraceId) ? { parentSpanId: pageEventParentSpanId(pageTraceId) } : {}),
   } as BrowserMonitorEvent);
 }
 
@@ -496,6 +595,7 @@ function installFetchPatch(): () => void {
         environment: currentOptions.environment,
         timestamp: Date.now(),
         traceId: prepared.traceId,
+        ...(pageEventParentSpanId(prepared.traceId) ? { parentSpanId: pageEventParentSpanId(prepared.traceId) } : {}),
       });
     };
 
@@ -533,9 +633,11 @@ function installFetchPatch(): () => void {
 
 interface XhrRequestMetadata {
   sameOrigin: boolean;
+  localRelayRequest: boolean;
   method: string;
   path: string;
   traceHeaderValues: string[];
+  parentSpanHeaderValues: string[];
   traceId?: string;
 }
 
@@ -573,11 +675,14 @@ function installXhrPatch(): () => void {
     password?: string | null,
   ): void {
     const sameOrigin = isSameOrigin(url);
+    const normalizedMethod = normalizeMethod(method);
     metadata.set(this, {
       sameOrigin,
-      method: normalizeMethod(method),
+      localRelayRequest: isLocalBrowserSpanTransportRequest(url, { method: normalizedMethod }),
+      method: normalizedMethod,
       path: sanitizePath(url) ?? '/',
       traceHeaderValues: [],
+      parentSpanHeaderValues: [],
     });
     if (async === undefined) return originalOpen.call(this, method, url, true, null, null);
     return originalOpen.call(this, method, url, async, username, password);
@@ -585,9 +690,16 @@ function installXhrPatch(): () => void {
 
   const wrappedSetRequestHeader: XMLHttpRequest['setRequestHeader'] = function (this: XMLHttpRequest, name, value) {
     const request = metadata.get(this);
-    if (request?.sameOrigin && name.toLowerCase() === TRACE_ID_HEADER) {
-      request.traceHeaderValues.push(value);
-      return;
+    if (request?.sameOrigin && !request.localRelayRequest && activeOptions?.enabled) {
+      const normalizedName = name.toLowerCase();
+      if (normalizedName === TRACE_ID_HEADER) {
+        request.traceHeaderValues.push(value);
+        return;
+      }
+      if (normalizedName === TRACE_PARENT_SPAN_ID_HEADER) {
+        request.parentSpanHeaderValues.push(value);
+        return;
+      }
     }
     return originalSetRequestHeader.call(this, name, value);
   };
@@ -595,12 +707,22 @@ function installXhrPatch(): () => void {
   const wrappedSend: XMLHttpRequest['send'] = function (this: XMLHttpRequest, body) {
     const request = metadata.get(this);
     const options = activeOptions;
-    if (!request?.sameOrigin || !options?.enabled) return originalSend.call(this, body);
+    if (!request?.sameOrigin || request.localRelayRequest || !options?.enabled) return originalSend.call(this, body);
 
     const headerTraceId = request.traceHeaderValues.length === 1 ? request.traceHeaderValues[0] : undefined;
-    const inboundTraceId = isValidTraceId(headerTraceId) ? headerTraceId : getPageTraceId();
+    const activePageTraceId = hasEventSink(options) ? pageTraceId : undefined;
+    const inboundTraceId = isValidTraceId(headerTraceId) ? headerTraceId : getPageTraceId() ?? activePageTraceId;
     request.traceId = resolveTraceId(undefined, inboundTraceId);
     originalSetRequestHeader.call(this, TRACE_ID_HEADER, request.traceId);
+
+    const parentSpanId = getActivePageParentSpanId(request.traceId);
+    if (parentSpanId) {
+      originalSetRequestHeader.call(this, TRACE_PARENT_SPAN_ID_HEADER, parentSpanId);
+    } else if (request.parentSpanHeaderValues.length === 1
+      && isValidSpanId(request.parentSpanHeaderValues[0])
+      && request.parentSpanHeaderValues[0] !== pageNavigationSpanId) {
+      originalSetRequestHeader.call(this, TRACE_PARENT_SPAN_ID_HEADER, request.parentSpanHeaderValues[0]);
+    }
 
     const shouldCapture = Boolean(options.captureErrors && hasEventSink(options));
     if (shouldCapture) {
@@ -625,6 +747,7 @@ function installXhrPatch(): () => void {
           environment: currentOptions.environment,
           timestamp: Date.now(),
           traceId: request.traceId!,
+          ...(pageEventParentSpanId(request.traceId!) ? { parentSpanId: pageEventParentSpanId(request.traceId!) } : {}),
         });
       };
       this.addEventListener('loadend', onLoadEnd, { once: true });
@@ -704,6 +827,7 @@ class BrowserMonitor implements BrowserMonitorController {
     }
 
     activeOptions = nextOptions;
+    ensurePageTraceRoot(nextOptions);
     try {
       this.cleanups = installRuntimeListeners(nextOptions);
     } catch (error) {

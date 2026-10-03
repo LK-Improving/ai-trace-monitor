@@ -118,11 +118,11 @@ monitor.teardown();
 
 默认启用开关仅在调用 `initBrowserMonitoring()` 后生效：`enabled`、`captureWebVitals`、`captureErrors` 默认为 `true`，`sampleRate` 默认为 `1`。采样率在每次启动时为整个页面会话抽样；未抽中的会话不会注册监听器、patch 网络方法或注入 Trace ID。`enabled: false` 与 `teardown()` 会停止采集和 Trace Header 注入。相同配置重复 `start()` 不会重复安装监听器或 patch。
 
-自动 fetch/XHR 处理只覆盖同源请求：注入一个符合 W1 格式的 `x-trace-id`，优先复用有效入站值，否则使用页面 meta 值或 Web Crypto 生成新值；同源网络错误和非 2xx 响应只产生 method、status、耗时和脱敏 path 元信息。跨域 fetch/XHR 原样通过，不注入 Header，也不采集事件。已有 `apiFetch()` 是显式 Trace-aware helper；浏览器中对跨域 URL 会跳过自动注入。
+自动 fetch/XHR 处理只覆盖同源请求：监控启用且有事件 sink 时，以本次页面导航的稳定 Trace ID 作为默认值；显式传入不同 Trace ID 时保留调用方的值，不附加页面父 Span。配置了 Browser Span transport 时，同 Trace 请求还会携带 `x-parent-span-id`，指向实际提交的 `browser.navigation` 根 Span。跨域 fetch/XHR 原样通过，不注入 Header，也不采集事件；固定的同源 relay POST 也不会被递归追踪。监控关闭或没有 transport 时不注入页面父 Span；已有 `apiFetch()` 是显式 Trace-aware helper，浏览器中对跨域 URL 会跳过自动注入。
 
 ## 隐私默认
 
-- SDK 不提供原文采集开关，也不读取或发送 Prompt、Response、用户输入、文档正文、请求/响应 body、Cookie、Authorization 或其他 Header。
+- SDK 不提供原文采集开关，也不读取或发送 Prompt、Response、用户输入、文档正文、请求/响应 body、Cookie、Authorization 或其他 Header。唯一自动传播的请求上下文是 `x-trace-id` 和受校验的 `x-parent-span-id`；任意业务 Header 值不会进入事件。
 - 网络事件不克隆或读取 Response body。路径去掉 query/hash，只保留已知固定路由名，其余路径段替换为 `:id`。JS 异常使用固定通用消息和标准错误类型，不读取原始异常消息或 rejection 文本；脚本路径也使用相同脱敏规则。
 - Web Vitals 使用 GoogleChrome/web-vitals 官方 `onCLS`、`onINP`、`onLCP`、`onFCP`、`onTTFB` 回调，只读取指标名、数值、变化量、评级和安全格式的指标 ID；不读取 performance entries 或 DOM attribution。
 - Web Vitals API 没有 observer teardown。SDK 每个页面生命周期最多注册一组观察器；teardown 后回调不再转发，重启时复用该组观察器。
@@ -131,11 +131,13 @@ monitor.teardown();
 
 核心 SDK 默认仍只把安全事件交给接入方的 `onEvent` / `transport`。独立的 `src/browser-span-transport.ts` 可由接入方显式创建，把固定服务 `web-sdk-demo`、环境 `dev` 的 SDK 事件转成 Browser Span；它不是生产网关，也不会创建、读取或暴露 projectKey、PLATFORM_ADMIN_TOKEN 或 Authorization。验收页的“上报到本地平台”默认关闭，只有勾选后启动 SDK 才创建 relay。
 
-Relay 只接受无 query/hash 的同源 endpoint，验收页固定使用 `POST /__sdk_test__/spans`。本地 Vite `configureServer` 通过根目录 `scripts/browser-span-relay.cjs` 提供此同源 BFF 路由；其他宿主需提供等价的 caller-owned BFF。浏览器请求 JSON 严格为 `{ environment: 'dev', spans: [...] }`，Span 仅含 `traceId`、`spanId`、`service`、`operation`、`startTime`、`endTime`、`status`、`attributes`。operation 固定映射为 `browser.web_vital`、`browser.javascript_error`、`browser.unhandled_rejection` 或 `browser.network_error`，且必须与 `attributes.eventType` 一致。属性只允许定义的安全诊断字段；原文 message、metricId、body、headers、parent ID 和 token usage 不发送。传入事件必须已属于 `web-sdk-demo` / `dev`，路径还会经过 relay 的白名单校验；Web Vital value 必须非负，delta 允许有符号并遵循 relay 的数值上限。
+Relay 只接受无 query/hash 的同源 endpoint，验收页固定使用 `POST /__sdk_test__/spans`。本地 Vite `configureServer` 通过根目录 `scripts/browser-span-relay.cjs` 提供此同源 BFF 路由；其他宿主需提供等价的 caller-owned BFF。浏览器请求 JSON 严格为 `{ environment: 'dev', spans: [...] }`，Span 仅含 `traceId`、`spanId`、可选 `parentSpanId`、`service`、`operation`、`startTime`、`endTime`、`status`、`attributes`。operation 固定映射为 `browser.navigation`、`browser.web_vital`、`browser.javascript_error`、`browser.unhandled_rejection` 或 `browser.network_error`，且必须与 `attributes.eventType` 一致。navigation 是无 URL/内容属性的真实根 Span；子 Span 的父 ID 必须为 32 位小写十六进制，其他未知字段一律拒绝。属性只允许定义的安全诊断字段；原文 message、metricId、body、headers 和 token usage 不发送。传入事件必须已属于 `web-sdk-demo` / `dev`，路径还会经过 relay 的白名单校验；Web Vital value 必须非负，delta 允许有符号并遵循 relay 的数值上限。
 
 队列上限 100，单请求最多 20 个 Span，自动 flush 每秒一次；“立即上报”可立即启动 flush，并在一个 flush 中分批发送。单次请求超时 3 秒。失败的批次不重试；非 HTTP 202、超时和网络失败只增加失败计数，不抛到业务调用，也不会由 SDK 再捕获。Relay 在 SDK 启动前解析未包装的 fetch，`api.ts` 还仅对固定的同源 `POST /__sdk_test__/spans` 做递归保护。请求不带 Authorization，并使用 `credentials: 'omit'`。验收页只把 HTTP 202 显示为“API内存排队”，它表示 API 进程内存队列已接收，不代表持久写入或 Collector 入库；停止时清空待发队列、取消进行中的请求并 dispose，同时保留计数供检查。
 
 该 relay 是一个可选的浏览器到宿主 BFF 接口示例，不是生产网关，也不替代应用自己的认证、生产反向代理或凭证管理。启动开发服务前在服务端进程设置 `SDK_TEST_PROJECT_KEY`。该密钥只供服务端 relay 使用，不能设置为 `VITE_*`，不会进入浏览器 Bundle 或 Span 请求体；服务端 relay 再使用此密钥转发到 API。未配置时 relay 会失败关闭；默认关闭状态不会发出上报请求。
+
+本地开发代理对允许的同源管理请求也只转发恰好一个且格式有效的 `x-trace-id`，并仅在 Trace ID 有效时转发恰好一个 32 位小写十六进制 `x-parent-span-id`；重复或格式错误的值会被省略，其他浏览器 Header 仍不透传。生产 BFF/反向代理必须显式加入这两个 allowlisted 追踪头的校验与转发规则，不能因此改成透传任意 Header 或浏览器凭证。
 
 ## 控制台真实数据链路（Phase 2 W18–W20）
 

@@ -9,7 +9,7 @@
 - Span 状态为 `ok | error`。时间戳为 Unix epoch 毫秒；`endTime` 可省略，提供时不能早于 `startTime`。
 - 环境在线路和存储中的唯一规范值为 `dev | staging | prod`。展示层的 “Development / Staging / Production” 必须映射为规范值，不能把 `development` 或 `production` 当作上报值。
 - Kafka 内部事件版本为 `schemaVersion: 1`。生产者显式写入 `1`；消费者兼容无版本字段的既有 v1 消息，并拒绝不支持的版本。
-- `x-trace-id` 是 HTTP 请求上下文的唯一来源；有效的入站 Header 优先，否则生成新 ID。成功与失败响应均回传最终 ID。
+- `x-trace-id` 是 Trace ID 的 HTTP 请求上下文来源；有效的入站 Header 优先，否则生成新 ID。成功与失败响应均回传最终 ID。可选的 `x-parent-span-id` 只能补充父 Span 上下文，不能决定或替代 Trace ID。
 - 项目密钥只授予单项目 `spans:write` 权限。鉴权后由服务端解析项目身份；明文密钥不得进入 Span、Kafka、ClickHouse 或日志。
 
 ## 2. Span 与事件模型
@@ -47,6 +47,8 @@ Kafka / Collector 消费的 `SpanEvent` 在 Span 基础上增加：
 3. 服务端后续内部调用、RAG / LLM 调用及记录的 Span 透传同一 Trace ID；不同 Span 用 `spanId / parentSpanId` 构成执行树。
 4. API 成功或失败响应都设置 `x-trace-id` 为最终解析值；浏览器跨域场景同时通过 `Access-Control-Expose-Headers: x-trace-id` 暴露该 Header。不能把无效的入站值回显给客户端。
 5. `resolveTraceId` 和 `traceIdResponseHeaders` 仅提供共享契约工具；具体 HTTP 中间件、异常处理器和 SDK 注入安排在后续周次实现。
+
+可选的 `x-parent-span-id` 只用于 HTTP 入站请求的父 Span 关联：仅当请求同时带有唯一、有效的 `x-trace-id` 时，API 才接受唯一的 32 位小写十六进制 parent ID，并将其写为 `http.server` Span 的 `parentSpanId`，不写入 attributes。Trace ID 缺失、无效或歧义时 API 仍按上述规则生成新 ID，同时忽略 parent，避免把新 Trace 错挂到其他 Trace 的孤儿父节点。它不能来自请求 Body，也不携带身份或权限。反向代理/BFF 如需支持跨服务关联，只能显式白名单透传这两个 Header；浏览器 SDK 不向跨域请求自动传播。
 
 允许的 ID 正则为 `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`。`trace_web_` 和 `trace_v1_` 分别是浏览器与服务端生成 ID 的推荐前缀，并非拒绝有效调用方 ID 的硬性前缀；两个前缀均通过同一 Trace ID 格式校验。
 

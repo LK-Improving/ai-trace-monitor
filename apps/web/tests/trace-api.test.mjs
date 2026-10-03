@@ -7,13 +7,21 @@ import ts from 'typescript';
 import { pathToFileURL } from 'node:url';
 
 const source = await readFile(new URL('../src/api.ts', import.meta.url), 'utf8');
-const { outputText } = ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-});
 const require = createRequire(import.meta.url);
 const webVitalsUrl = pathToFileURL(join(dirname(require.resolve('web-vitals')), 'web-vitals.js')).href;
-const runnableOutput = outputText.replaceAll("'web-vitals'", `'${webVitalsUrl}'`);
-const api = await import(`data:text/javascript;base64,${Buffer.from(runnableOutput).toString('base64')}`);
+let apiModuleInstance = 0;
+
+async function loadApiModule() {
+  const { outputText } = ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+  });
+  const runnableOutput = outputText.replaceAll("'web-vitals'", `'${webVitalsUrl}'`)
+    + `\n// isolated API module ${apiModuleInstance++}`;
+  return import(`data:text/javascript;base64,${Buffer.from(runnableOutput).toString('base64')}`);
+}
+
+const api = await loadApiModule();
+let pageNavigationEventForAssertions;
 
 function replaceGlobal(name, value) {
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
@@ -49,7 +57,7 @@ function createWindowMock() {
   };
 }
 
-function setupBrowserGlobals({ fetch = globalThis.fetch, XMLHttpRequest = undefined } = {}) {
+function setupBrowserGlobals({ fetch = globalThis.fetch, XMLHttpRequest = undefined, apiInstance = api } = {}) {
   const window = createWindowMock();
   const restore = [
     replaceGlobal('location', { href: 'https://app.example.test/page?private=1#hash', origin: 'https://app.example.test' }),
@@ -60,7 +68,7 @@ function setupBrowserGlobals({ fetch = globalThis.fetch, XMLHttpRequest = undefi
   return {
     window,
     restore() {
-      api.teardownBrowserMonitoring();
+      apiInstance.teardownBrowserMonitoring();
       for (const undo of restore.reverse()) undo();
     },
   };
@@ -186,20 +194,28 @@ test('same-origin fetch injects Trace ID and emits only sanitized network metada
     assert.equal(await response.text(), 'RESPONSE_SENTINEL');
     assert.equal(fetchCalls[0].init.body, body);
     assert.ok(api.isValidTraceId(new Headers(fetchCalls[0].init.headers).get('x-trace-id')));
+    const navigation = transportedEvents[0];
+    assert.equal(navigation.type, 'navigation');
+    assert.match(navigation.spanId, /^[a-f0-9]{32}$/);
+    assert.equal(navigation.traceId, new Headers(fetchCalls[0].init.headers).get('x-trace-id'));
+    assert.equal(new Headers(fetchCalls[0].init.headers).get('x-parent-span-id'), navigation.spanId);
+    assert.equal('url' in navigation, false);
+    pageNavigationEventForAssertions = navigation;
 
     await assert.rejects(globalThis.fetch('/api/v1/fail/user-input?secret=query', { method: 'GET' }), /RESPONSE_SENTINEL/);
-    assert.equal(events.length, 2);
-    assert.equal(transportedEvents.length, 2);
-    assert.deepEqual(events.map((event) => [event.type, event.reason, event.status]), [
+    assert.equal(events.length, 3);
+    assert.equal(transportedEvents.length, 3);
+    assert.deepEqual(events.filter((event) => event.type === 'network_error').map((event) => [event.type, event.reason, event.status]), [
       ['network_error', 'http', 503],
       ['network_error', 'network', 0],
     ]);
-    assert.equal(events[0].method, 'POST');
-    assert.equal(events[0].path, '/api/v1/chat/:id');
-    assert.equal(events[0].traceId, new Headers(fetchCalls[0].init.headers).get('x-trace-id'));
-    assert.equal(events[0].service, 'customer-web');
-    assert.equal(events[0].environment, 'dev');
-    assert.equal(events[0].durationMs >= 0, true);
+    assert.equal(events[1].method, 'POST');
+    assert.equal(events[1].path, '/api/v1/chat/:id');
+    assert.equal(events[1].traceId, navigation.traceId);
+    assert.equal(events[1].parentSpanId, navigation.spanId);
+    assert.equal(events[1].service, 'customer-web');
+    assert.equal(events[1].environment, 'dev');
+    assert.equal(events[1].durationMs >= 0, true);
     assert.equal(fetchCalls.length, 2);
     for (const event of events) {
       const serialized = JSON.stringify(event);
@@ -210,6 +226,99 @@ test('same-origin fetch injects Trace ID and emits only sanitized network metada
       assert.equal('body' in event, false);
       assert.equal('headers' in event, false);
     }
+  } finally {
+    monitor.teardown();
+    browser.restore();
+  }
+});
+
+test('one browser navigation root parents same-origin fetch, XHR, and exception events without capturing relay or cross-origin traffic', async () => {
+  const isolatedApi = await loadApiModule();
+  const calls = [];
+  const nativeFetch = async (input, init = {}) => {
+    calls.push({ input, init });
+    return new Response(null, { status: 204 });
+  };
+  class MockXhr {
+    status = 204;
+    headers = [];
+    open(method, url) { this.method = method; this.url = url; }
+    setRequestHeader(name, value) { this.headers.push([name, value]); }
+    send(body) { this.body = body; }
+    addEventListener() {}
+    removeEventListener() {}
+  }
+  const browser = setupBrowserGlobals({ fetch: nativeFetch, XMLHttpRequest: MockXhr, apiInstance: isolatedApi });
+  const events = [];
+  const transportEvents = [];
+  const options = {
+    service: 'web-sdk-demo', environment: 'dev', captureWebVitals: false,
+    onEvent: (event) => events.push(event),
+    transport: (event) => transportEvents.push(event),
+  };
+  const monitor = isolatedApi.initBrowserMonitoring(options);
+
+  try {
+    const navigation = transportEvents[0];
+    assert.equal(navigation.type, 'navigation');
+    assert.match(navigation.spanId, /^[a-f0-9]{32}$/);
+    assert.equal(navigation.startTime <= navigation.timestamp, true);
+    assert.deepEqual(Object.keys(navigation).sort(), [
+      'environment', 'service', 'spanId', 'startTime', 'timestamp', 'traceId', 'type',
+    ]);
+    monitor.start(options);
+    assert.equal(transportEvents.filter((event) => event.type === 'navigation').length, 1);
+
+    await globalThis.fetch('/api/v1/health');
+    await globalThis.fetch('/api/v1/chat', { headers: { 'x-trace-id': 'trace_web_caller-override' } });
+    await isolatedApi.apiFetch('/api/v1/chat', { traceId: 'trace_web_explicit-override' });
+    await globalThis.fetch('https://third-party.example.test/collect');
+    await globalThis.fetch('/__sdk_test__/spans', { method: 'POST', body: '{}' });
+
+    const navigationRequest = new Headers(calls[0].init.headers);
+    assert.equal(navigationRequest.get('x-trace-id'), navigation.traceId);
+    assert.equal(navigationRequest.get('x-parent-span-id'), navigation.spanId);
+    for (const call of calls.slice(1, 3)) {
+      const headers = new Headers(call.init.headers);
+      assert.notEqual(headers.get('x-trace-id'), navigation.traceId);
+      assert.equal(headers.has('x-parent-span-id'), false);
+    }
+    assert.equal(new Headers(calls[3].init.headers).has('x-trace-id'), false);
+    assert.equal(new Headers(calls[3].init.headers).has('x-parent-span-id'), false);
+    assert.equal(new Headers(calls[4].init.headers).has('x-trace-id'), false);
+    assert.equal(new Headers(calls[4].init.headers).has('x-parent-span-id'), false);
+
+    const xhr = new globalThis.XMLHttpRequest();
+    xhr.open('GET', '/api/v1/health');
+    xhr.send();
+    assert.deepEqual(xhr.headers, [
+      ['x-trace-id', navigation.traceId],
+      ['x-parent-span-id', navigation.spanId],
+    ]);
+
+    const overriddenXhr = new globalThis.XMLHttpRequest();
+    overriddenXhr.open('GET', '/api/v1/health');
+    overriddenXhr.setRequestHeader('x-trace-id', 'trace_web_xhr-override');
+    overriddenXhr.send();
+    assert.deepEqual(overriddenXhr.headers, [['x-trace-id', 'trace_web_xhr-override']]);
+
+    const crossOriginXhr = new globalThis.XMLHttpRequest();
+    crossOriginXhr.open('GET', 'https://third-party.example.test/data');
+    crossOriginXhr.send();
+    assert.deepEqual(crossOriginXhr.headers, []);
+
+    const relayXhr = new globalThis.XMLHttpRequest();
+    relayXhr.open('POST', '/__sdk_test__/spans');
+    relayXhr.send('{}');
+    assert.deepEqual(relayXhr.headers, []);
+
+    browser.window.dispatch('error', { error: new TypeError('private detail') });
+    browser.window.dispatch('unhandledrejection', { reason: 'private rejection' });
+    const exceptions = transportEvents.filter((event) => event.type === 'javascript_error' || event.type === 'unhandled_rejection');
+    assert.equal(exceptions.length, 2);
+    assert.ok(exceptions.every((event) => event.traceId === navigation.traceId && event.parentSpanId === navigation.spanId));
+    assert.equal(JSON.stringify(transportEvents).includes('private detail'), false);
+    assert.equal(JSON.stringify(transportEvents).includes('private rejection'), false);
   } finally {
     monitor.teardown();
     browser.restore();
@@ -260,6 +369,7 @@ test('same-origin XHR injects a single valid ID and emits no body or header valu
 
     const traceHeaders = xhr.headers.filter(([name]) => name.toLowerCase() === 'x-trace-id');
     assert.deepEqual(traceHeaders, [['x-trace-id', 'trace_web_existing-1']]);
+    assert.equal(xhr.headers.some(([name]) => name.toLowerCase() === 'x-parent-span-id'), false);
     assert.equal(xhr.body, 'BODY_SENTINEL');
     assert.equal(events.length, 1);
     assert.equal(events[0].type, 'network_error');
@@ -268,6 +378,7 @@ test('same-origin XHR injects a single valid ID and emits no body or header valu
     assert.equal(events[0].status, 418);
     assert.equal(events[0].path, '/api/v1/users/:id');
     assert.equal(events[0].traceId, 'trace_web_existing-1');
+    assert.equal('parentSpanId' in events[0], false);
     assert.equal(JSON.stringify(events[0]).includes('BODY_SENTINEL'), false);
     assert.equal(JSON.stringify(events[0]).includes('AUTH_SENTINEL'), false);
 
@@ -311,6 +422,9 @@ test('JavaScript errors and rejections emit generic safe diagnostics without raw
     assert.equal(events[1].type, 'unhandled_rejection');
     assert.equal(events[1].message, 'Unhandled promise rejection');
     assert.equal(events[1].errorName, 'Error');
+    assert.ok(pageNavigationEventForAssertions);
+    assert.equal(events[0].parentSpanId, pageNavigationEventForAssertions.spanId);
+    assert.equal(events[1].parentSpanId, pageNavigationEventForAssertions.spanId);
     const serialized = JSON.stringify(events);
     for (const privateText of ['PROMPT_SENTINEL', 'RESPONSE_SENTINEL', 'USER_INPUT_SENTINEL', 'secret', 'fragment']) {
       assert.equal(serialized.includes(privateText), false);

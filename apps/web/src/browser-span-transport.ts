@@ -13,6 +13,7 @@ const MAX_BATCH_SIZE = 20;
 const MAX_TIMEOUT_MS = 3_000;
 
 const TRACE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const SPAN_ID_PATTERN = /^[a-f0-9]{32}$/;
 const SAFE_ERROR_NAMES = new Set([
   'AggregateError', 'DOMException', 'Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError',
   'TypeError', 'URIError',
@@ -29,8 +30,10 @@ const SAFE_METHODS = new Set([
 export interface BrowserTraceSpan {
   traceId: string;
   spanId: string;
+  parentSpanId?: string;
   service: typeof BROWSER_SPAN_SERVICE;
   operation:
+    | 'browser.navigation'
     | 'browser.web_vital'
     | 'browser.javascript_error'
     | 'browser.unhandled_rejection'
@@ -121,6 +124,11 @@ function safeRating(value: unknown): value is 'good' | 'needs-improvement' | 'po
   return value === 'good' || value === 'needs-improvement' || value === 'poor';
 }
 
+function hasOnlyKeys(value: unknown, allowed: readonly string[]): boolean {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).every((key) => allowed.includes(key));
+}
+
 /** Convert one SDK event into a strict, privacy-filtered Span. Invalid events are dropped. */
 export function convertBrowserMonitorEventToSpan(event: BrowserMonitorEvent): BrowserTraceSpan | undefined {
   try {
@@ -130,12 +138,35 @@ export function convertBrowserMonitorEventToSpan(event: BrowserMonitorEvent): Br
     if (event.service !== BROWSER_SPAN_SERVICE || event.environment !== BROWSER_SPAN_ENVIRONMENT
       || typeof traceId !== 'string' || !TRACE_ID_PATTERN.test(traceId) || !isSafeUnixMilliseconds(endTime)) return undefined;
 
+    const commonFields = ['type', 'service', 'environment', 'timestamp', 'traceId'];
+    const allowedFields = type === 'navigation'
+      ? [...commonFields, 'spanId', 'startTime']
+      : type === 'web_vital'
+        ? [...commonFields, 'parentSpanId', 'metric', 'value', 'delta', 'rating', 'metricId']
+        : type === 'javascript_error'
+          ? [...commonFields, 'parentSpanId', 'message', 'errorName', 'path', 'line', 'column']
+          : type === 'unhandled_rejection'
+            ? [...commonFields, 'parentSpanId', 'message', 'errorName']
+            : type === 'network_error'
+              ? [...commonFields, 'parentSpanId', 'source', 'reason', 'method', 'status', 'durationMs', 'path']
+              : undefined;
+    if (!allowedFields || !hasOnlyKeys(event, allowedFields)) return undefined;
+    const parentSpanId = type !== 'navigation' ? event.parentSpanId : undefined;
+    if (type !== 'navigation' && parentSpanId !== undefined && !SPAN_ID_PATTERN.test(parentSpanId)) return undefined;
+
     const attributes: Record<string, string | number> = { eventType: type };
     let operation: BrowserTraceSpan['operation'];
     let status: BrowserTraceSpan['status'];
     let startTime = endTime;
 
-    if (type === 'web_vital') {
+    if (type === 'navigation') {
+      operation = 'browser.navigation';
+      status = 'ok';
+      if (!SPAN_ID_PATTERN.test(event.spanId) || !isSafeUnixMilliseconds(event.startTime) || event.startTime > endTime) {
+        return undefined;
+      }
+      startTime = event.startTime;
+    } else if (type === 'web_vital') {
       operation = 'browser.web_vital';
       status = 'ok';
       if (!['CLS', 'INP', 'LCP', 'FCP', 'TTFB'].includes(event.metric)
@@ -186,7 +217,8 @@ export function convertBrowserMonitorEventToSpan(event: BrowserMonitorEvent): Br
 
     return {
       traceId,
-      spanId: safeSpanId(),
+      spanId: type === 'navigation' ? event.spanId : safeSpanId(),
+      ...(parentSpanId === undefined ? {} : { parentSpanId }),
       service: BROWSER_SPAN_SERVICE,
       operation,
       startTime,

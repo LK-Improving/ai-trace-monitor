@@ -1,6 +1,10 @@
 import { Injectable, type ExecutionContext, type NestInterceptor } from '@nestjs/common';
 import { Observable } from 'rxjs';
-import { resolveApiTraceId, TRACE_ID_HEADER } from '../trace/trace-id.middleware';
+import {
+  resolveApiParentSpanId,
+  resolveApiTraceId,
+  TRACE_ID_HEADER,
+} from '../trace/trace-id.middleware';
 import { TraceObservabilityService } from './trace-observability.service';
 import { TraceContext } from './trace-context';
 
@@ -12,6 +16,7 @@ interface HttpTraceRequest {
   route?: { path?: string | string[] };
   headers: Record<string, string | string[] | undefined>;
   traceId?: string;
+  parentSpanId?: string;
 }
 
 interface HttpTraceResponse {
@@ -62,7 +67,8 @@ export class HttpTraceInterceptor implements NestInterceptor {
     response.setHeader(TRACE_ID_HEADER, traceId);
 
     return new Observable((subscriber) => {
-      const span = recorder.start('http.server', traceId);
+      const parentSpanId = resolveApiParentSpanId(request.parentSpanId);
+      const span = recorder.start('http.server', traceId, parentSpanId);
       if (typeof request.method === 'string') span.set('http.method', request.method);
       if (typeof request.route?.path === 'string') span.set('http.route', request.route.path);
 

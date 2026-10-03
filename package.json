@@ -9,7 +9,8 @@
     "test:w8:relay": "node --test scripts/tests/browser-span-relay.test.cjs",
     "acceptance:w8": "node scripts/w8-acceptance-session.cjs",
     "infra:up": "docker compose up -d --wait",
-    "infra:down": "docker compose down"
+    "infra:down": "docker compose down",
+    "acceptance:w30:g3": "node scripts/w30-g3-acceptance.cjs"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

@@ -44,12 +44,14 @@ let spanTransport: BrowserSpanTransport | undefined;
 let retainedTransportStatus: BrowserSpanTransportStatus | undefined;
 
 function eventTitle(event: BrowserMonitorEvent): string {
+  if (event.type === 'navigation') return 'Browser navigation';
   if (event.type === 'network_error') return `${event.method} ${event.path} · ${event.status || event.reason}`;
   if (event.type === 'web_vital') return `${event.metric} · ${event.value}`;
   return event.message;
 }
 
 function eventKind(event: BrowserMonitorEvent): string {
+  if (event.type === 'navigation') return 'NAVIGATION';
   if (event.type === 'network_error') return 'NETWORK';
   if (event.type === 'web_vital') return 'VITAL';
   if (event.type === 'javascript_error') return 'JS ERROR';

@@ -46,7 +46,7 @@ function collectorPayload(overrides = {}) {
   };
 }
 
-function makeService(getQueueMetrics = queueMetrics) {
+function makeService(getQueueMetrics = queueMetrics, configOverrides = {}) {
   const database = { ping: async () => undefined };
   const queue = { metrics: getQueueMetrics };
   const clickhouse = {
@@ -56,7 +56,7 @@ function makeService(getQueueMetrics = queueMetrics) {
       p50Ms: null, p95Ms: null, p99Ms: null,
     }),
   };
-  return new OpsHealthService(configuration(), database, queue, clickhouse);
+  return new OpsHealthService(configuration(configOverrides), database, queue, clickhouse);
 }
 
 function stubHealthyDependencies(service, except) {
@@ -273,6 +273,31 @@ test('collector payload is exact-schema validated and an unavailable source prod
   assert.equal(unavailable.consumerGroup, 'trace-ops-collector');
   assert.equal(unavailable.failedBatches, null);
   await service.onModuleDestroy();
+});
+
+test('collector health probe uses an optional validated loopback port and defaults to 3011', async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const endpoints = [];
+  globalThis.fetch = async (url) => {
+    endpoints.push(String(url));
+    return new Response(JSON.stringify(collectorPayload()), { status: 200 });
+  };
+
+  const defaultService = makeService();
+  await defaultService.probeCollector();
+  const customService = makeService(queueMetrics, { COLLECTOR_OPS_HEALTH_PORT: '32123' });
+  await customService.probeCollector();
+  const invalidService = makeService(queueMetrics, { COLLECTOR_OPS_HEALTH_PORT: 'https://example.test' });
+  assert.equal((await invalidService.probeCollector()).status, 'unavailable');
+
+  assert.deepEqual(endpoints, [
+    'http://127.0.0.1:3011/internal/ops/health',
+    'http://127.0.0.1:32123/internal/ops/health',
+  ]);
+  await defaultService.onModuleDestroy();
+  await customService.onModuleDestroy();
+  await invalidService.onModuleDestroy();
 });
 
 test('collector request timeout aborts and maps unavailable measurements to null', async (t) => {

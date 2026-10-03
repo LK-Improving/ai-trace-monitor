@@ -14,6 +14,7 @@ const ROUTE = '/__sdk_test__/spans';
 const PROJECT_KEY = 'tr_' + 'A'.repeat(43);
 const PRIVATE_CANARY = 'browser_private_canary_7f3a';
 const OPERATION_BY_EVENT_TYPE = {
+  navigation: 'browser.navigation',
   web_vital: 'browser.web_vital',
   javascript_error: 'browser.javascript_error',
   unhandled_rejection: 'browser.unhandled_rejection',
@@ -25,7 +26,9 @@ function makeSpan(eventType = 'javascript_error', overrides = {}) {
   const endTime = Date.now();
   let startTime = endTime;
   let attributes = { eventType };
-  if (eventType === 'web_vital') {
+  if (eventType === 'navigation') {
+    startTime = endTime - 250;
+  } else if (eventType === 'web_vital') {
     attributes = { eventType, metric: 'LCP', value: 1_234, delta: -12, rating: 'good' };
   } else if (eventType === 'javascript_error' || eventType === 'unhandled_rejection') {
     attributes.errorName = 'TypeError';
@@ -48,7 +51,7 @@ function makeSpan(eventType = 'javascript_error', overrides = {}) {
     operation: OPERATION_BY_EVENT_TYPE[eventType],
     startTime,
     endTime,
-    status: eventType === 'web_vital' ? 'ok' : 'error',
+    status: eventType === 'web_vital' || eventType === 'navigation' ? 'ok' : 'error',
     attributes,
   };
   const spanOverrides = {};
@@ -195,7 +198,7 @@ function sendRequest(port, options = {}) {
   });
 }
 
-test('接受前端 TraceSpan、保留标识与时间并验证四类 operation/eventType 语义', async (t) => {
+test('接受前端 TraceSpan、保留标识与时间并验证五类 operation/eventType 语义', async (t) => {
   const harness = await makeHarness(t);
   const spans = [
     makeSpan('web_vital'),
@@ -426,12 +429,40 @@ test('projectKey 未配置或 apiPort 非法时返回固定 503', async (t) => {
   assert.equal(harness.upstreamRequests.length, 0);
 });
 
+test('接受 browser.navigation 根 Span 与有效 parentSpanId，并将父子关系安全转发', async (t) => {
+  const harness = await makeHarness(t);
+  const root = makeSpan('navigation');
+  const vital = makeSpan('web_vital', { parentSpanId: root.spanId });
+  const exception = makeSpan('javascript_error', { parentSpanId: root.spanId });
+  const response = await sendRequest(harness.webPort, {
+    body: makeBody([root, vital, exception]),
+    headers: { 'x-trace-id': root.traceId },
+  });
+
+  assert.equal(response.status, 202);
+  const envelope = JSON.parse(harness.upstreamRequests[0].bodyText);
+  assert.deepEqual(envelope.spans.map((span) => [span.operation, span.parentSpanId ?? null]), [
+    ['browser.navigation', null],
+    ['browser.web_vital', root.spanId],
+    ['browser.javascript_error', root.spanId],
+  ]);
+  assert.deepEqual(envelope.spans[0].attributes, { eventType: 'navigation' });
+  assert.equal(envelope.spans[0].status, 'ok');
+  assert.deepEqual(Object.keys(envelope.spans[0].attributes), ['eventType']);
+  assert.deepEqual(Object.keys(envelope.spans[0]).sort(), [
+    'attributes', 'endTime', 'operation', 'service', 'spanId', 'startTime', 'status', 'traceId',
+  ]);
+});
+
 test('拒绝非法 JSON、额外字段、未知事件字段和未脱敏 path，不转发 canary', async (t) => {
   const harness = await makeHarness(t);
   const requests = [
     { bodyText: '{"environment":' },
     { body: makeBody([makeSpan('javascript_error')], { projectKey: PRIVATE_CANARY }) },
     { body: makeBody([makeSpan('javascript_error', { extra: PRIVATE_CANARY })]) },
+    { body: makeBody([makeSpan('javascript_error', { parentSpanId: 'malformed-parent' })]) },
+    { body: makeBody([makeSpan('javascript_error', { parentSpanId: 'a'.repeat(32), extra: PRIVATE_CANARY })]) },
+    { body: makeBody([makeSpan('javascript_error', { parentSpanId: '1'.repeat(32), spanId: '1'.repeat(32) })]) },
     { body: makeBody([makeSpan('javascript_error', { message: PRIVATE_CANARY })]) },
     {
       body: makeBody([makeSpan('network_error', { path: '/api/users/' + PRIVATE_CANARY })]),

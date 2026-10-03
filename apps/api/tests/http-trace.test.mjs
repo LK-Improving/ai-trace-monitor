@@ -302,6 +302,112 @@ test('六棵并发 trace 树保持 ALS 隔离，分别形成 root→rag→tool �
   assert.deepEqual(Object.keys(sampleRoot.attributes).sort(), ['http.method', 'http.route', 'http.status_code']);
 });
 
+test('可选 parent header 只关联到 http.server root，异常值不影响响应与 Trace ID', async (t) => {
+  const fixture = await createTestApp();
+  t.after(() => fixture.app.close());
+
+  const validParent = '0123456789abcdef0123456789abcdef';
+  const cases = [
+    {
+      name: 'valid parent',
+      traceId: 'trace-parent-valid',
+      parentHeader: validParent,
+      expectedParent: validParent,
+    },
+    {
+      name: 'missing parent',
+      traceId: 'trace-parent-missing',
+      expectedParent: undefined,
+    },
+    {
+      name: 'malformed parent with valid trace',
+      traceId: 'trace-parent-malformed',
+      parentHeader: 'browser-span-private-value',
+      expectedParent: undefined,
+    },
+    {
+      name: 'ambiguous duplicate parent values',
+      traceId: 'trace-parent-duplicate',
+      parentHeader: `${validParent}, ${validParent}`,
+      expectedParent: undefined,
+    },
+    {
+      name: 'missing trace ignores valid parent',
+      parentHeader: validParent,
+      expectedParent: undefined,
+      expectGeneratedTraceId: true,
+    },
+    {
+      name: 'invalid trace remains server-generated and ignores parent',
+      traceId: 'invalid trace id',
+      parentHeader: validParent,
+      expectedParent: undefined,
+      expectGeneratedTraceId: true,
+    },
+    {
+      name: 'duplicate trace values remain server-generated and ignore parent',
+      traceId: 'trace-parent-duplicate, trace-parent-duplicate',
+      parentHeader: validParent,
+      expectedParent: undefined,
+      expectGeneratedTraceId: true,
+    },
+  ];
+
+  for (const testCase of cases) {
+    const headers = {};
+    if (testCase.traceId !== undefined) headers['x-trace-id'] = testCase.traceId;
+    if (testCase.parentHeader !== undefined) headers['x-parent-span-id'] = testCase.parentHeader;
+
+    const response = await fetch(`${fixture.baseUrl}/plain`, { headers });
+    assert.equal(response.status, 200, testCase.name);
+    assert.deepEqual(await response.json(), { ok: true }, testCase.name);
+
+    const responseTraceId = response.headers.get('x-trace-id');
+    assert.ok(responseTraceId, `${testCase.name}: response must retain x-trace-id`);
+    if (testCase.expectGeneratedTraceId) {
+      assert.notEqual(responseTraceId, testCase.traceId);
+      assert.match(responseTraceId, /^trace_v1_[0-9a-f-]{36}$/i);
+    } else {
+      assert.equal(responseTraceId, testCase.traceId, testCase.name);
+    }
+
+    await waitFor(
+      () => fixture.recorder.spans.some((span) => span.operation === 'http.server' && span.traceId === responseTraceId && span.ended),
+      `${testCase.name}: root span did not finish`,
+    );
+    const root = fixture.recorder.spans.find((span) => span.operation === 'http.server' && span.traceId === responseTraceId);
+    assert.equal(root.parentSpanId, testCase.expectedParent, testCase.name);
+    assert.deepEqual(Object.keys(root.attributes).sort(), ['http.method', 'http.route', 'http.status_code']);
+    if (testCase.parentHeader !== undefined) {
+      assert.equal(JSON.stringify(root.attributes).includes(testCase.parentHeader), false, testCase.name);
+    }
+  }
+
+  const treeParent = 'fedcba9876543210fedcba9876543210';
+  const treeResponse = await fetch(`${fixture.baseUrl}/async/parent-context`, {
+    headers: {
+      'x-trace-id': 'trace-parent-tree',
+      'x-parent-span-id': treeParent,
+    },
+  });
+  assert.equal(treeResponse.status, 200);
+  assert.deepEqual(await treeResponse.json(), { key: 'parent-context' });
+  await waitFor(
+    () => fixture.recorder.spans.some((span) => span.operation === 'http.server' && span.traceId === 'trace-parent-tree' && span.ended),
+    'parent-context request root did not finish',
+  );
+  const treeRoot = fixture.recorder.spans.find((span) => span.operation === 'http.server' && span.traceId === 'trace-parent-tree');
+  const treeChildren = fixture.recorder.spans.filter((span) => span.traceId === 'trace-parent-tree' && span.operation !== 'http.server');
+  const rag = treeChildren.find((span) => span.operation === 'rag');
+  const tool = treeChildren.find((span) => span.operation === 'tool');
+  const llm = treeChildren.find((span) => span.operation === 'llm');
+  assert.equal(treeRoot.parentSpanId, treeParent);
+  assert.equal(rag.parentSpanId, treeRoot.id);
+  assert.equal(tool.parentSpanId, rag.id);
+  assert.equal(llm.parentSpanId, treeRoot.id);
+  assert.equal(treeChildren.some((span) => span.parentSpanId === treeParent), false);
+});
+
 test('400 和 500 业务错误原样透传，异常过滤器最终状态写入 response span', async (t) => {
   const fixture = await createTestApp();
   t.after(() => fixture.app.close());

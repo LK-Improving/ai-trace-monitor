@@ -2,8 +2,20 @@ import { createServer, type Server, type ServerResponse } from 'node:http';
 import { CollectorTelemetry } from './collector-telemetry';
 
 export const OPS_HEALTH_BIND_HOST = '127.0.0.1';
-export const OPS_HEALTH_PORT = 3011;
+export const DEFAULT_OPS_HEALTH_PORT = 3011;
 export const OPS_HEALTH_PATH = '/internal/ops/health';
+
+export function resolveOpsHealthPort(value = process.env.COLLECTOR_OPS_HEALTH_PORT): number {
+  if (value === undefined) return DEFAULT_OPS_HEALTH_PORT;
+  if (!/^[0-9]{1,5}$/.test(value)) throw new TypeError('Invalid Collector ops health port');
+  const port = Number(value);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    throw new TypeError('Invalid Collector ops health port');
+  }
+  return port;
+}
+
+export const OPS_HEALTH_PORT = resolveOpsHealthPort();
 
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
   response.statusCode = status;
@@ -34,6 +46,6 @@ export function createOpsHealthServer(telemetry: CollectorTelemetry): Server {
 }
 
 /** Keep the production bind address and port fixed and loopback-only. */
-export function listenOpsHealthServer(server: Server): void {
-  server.listen(OPS_HEALTH_PORT, OPS_HEALTH_BIND_HOST);
+export function listenOpsHealthServer(server: Server, port = OPS_HEALTH_PORT): void {
+  server.listen(port, OPS_HEALTH_BIND_HOST);
 }

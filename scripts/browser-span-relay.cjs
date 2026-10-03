@@ -12,6 +12,7 @@ const DEFAULT_MAX_REQUESTS_PER_MINUTE = 120;
 const TRACE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const PROJECT_KEY_PATTERN = /^tr_[A-Za-z0-9_-]{43}$/;
 const EVENT_OPERATION = Object.freeze({
+  navigation: 'browser.navigation',
   web_vital: 'browser.web_vital',
   javascript_error: 'browser.javascript_error',
   unhandled_rejection: 'browser.unhandled_rejection',
@@ -257,7 +258,8 @@ function buildSafeSpan(span) {
     'status',
     'attributes',
   ];
-  if (!hasKeys(span, spanFields, spanFields)) throw invalidRequest();
+  if (!hasKeys(span, spanFields, [...spanFields, 'parentSpanId'])) throw invalidRequest();
+  const hasParentSpanId = Object.prototype.hasOwnProperty.call(span, 'parentSpanId');
   if (
     typeof span.traceId !== 'string'
     || !TRACE_ID_PATTERN.test(span.traceId)
@@ -273,6 +275,9 @@ function buildSafeSpan(span) {
     || typeof span.attributes.eventType !== 'string'
     || !Object.prototype.hasOwnProperty.call(EVENT_OPERATION, span.attributes.eventType)
     || span.operation !== EVENT_OPERATION[span.attributes.eventType]
+    || (hasParentSpanId && (typeof span.parentSpanId !== 'string'
+      || !/^[a-f0-9]{32}$/.test(span.parentSpanId)
+      || span.parentSpanId === span.spanId))
   ) {
     throw invalidRequest();
   }
@@ -283,7 +288,14 @@ function buildSafeSpan(span) {
   let safeAttributes;
   let expectedStatus;
 
-  if (eventType === 'web_vital') {
+  if (eventType === 'navigation') {
+    if (!hasKeys(inputAttributes, commonAttribute, commonAttribute)
+      || hasParentSpanId || span.startTime > span.endTime) {
+      throw invalidRequest();
+    }
+    safeAttributes = { eventType };
+    expectedStatus = 'ok';
+  } else if (eventType === 'web_vital') {
     const fields = [...commonAttribute, 'metric', 'value', 'delta', 'rating'];
     if (!hasKeys(inputAttributes, fields, fields)) throw invalidRequest();
     if (
@@ -370,6 +382,7 @@ function buildSafeSpan(span) {
   return {
     traceId: span.traceId,
     spanId: span.spanId,
+    ...(hasParentSpanId ? { parentSpanId: span.parentSpanId } : {}),
     service: SERVICE,
     operation: EVENT_OPERATION[eventType],
     startTime: span.startTime,

@@ -102,6 +102,15 @@ function makeEvent(type = 'network_error', overrides = {}) {
     timestamp: eventTime,
     traceId,
   };
+  if (type === 'navigation') {
+    return {
+      ...base,
+      type,
+      spanId: '1'.repeat(32),
+      startTime: eventTime - 250,
+      ...overrides,
+    };
+  }
   if (type === 'web_vital') {
     return {
       ...base,
@@ -144,8 +153,6 @@ function makeEvent(type = 'network_error', overrides = {}) {
     status: 503,
     durationMs: 25,
     path: '/api/v1/chat/:id',
-    body: 'BODY_PRIVATE_SENTINEL',
-    headers: { authorization: 'AUTH_PRIVATE_SENTINEL' },
     ...overrides,
   };
 }
@@ -153,6 +160,7 @@ function makeEvent(type = 'network_error', overrides = {}) {
 test('the converter maps real SDK event kinds into strict spans and only whitelisted attributes', async () => {
   const transport = await loadTransport();
   const cases = [
+    ['navigation', 'browser.navigation', 'ok'],
     ['web_vital', 'browser.web_vital', 'ok'],
     ['javascript_error', 'browser.javascript_error', 'error'],
     ['unhandled_rejection', 'browser.unhandled_rejection', 'error'],
@@ -169,6 +177,10 @@ test('the converter maps real SDK event kinds into strict spans and only whiteli
     assert.equal(span.service, 'web-sdk-demo');
     assert.equal(span.endTime, eventTime);
     assert.match(span.spanId, /^[a-f0-9]{32}$/);
+    if (type === 'navigation') {
+      assert.equal(span.spanId, '1'.repeat(32));
+      assert.equal(span.startTime, eventTime - 250);
+    }
     assert.equal('parentId' in span, false);
     assert.equal('parentSpanId' in span, false);
     assert.equal('tokenUsage' in span, false);
@@ -186,10 +198,15 @@ test('the converter maps real SDK event kinds into strict spans and only whiteli
     path: '/api/v1/chat/:id', httpStatus: 503,
   });
 
+  const parentSpanId = 'a'.repeat(32);
+  const child = transport.convertBrowserMonitorEventToSpan(makeEvent('web_vital', { parentSpanId }));
+  assert.equal(child.parentSpanId, parentSpanId);
+  assert.equal(child.operation, 'browser.web_vital');
+
   const serialized = JSON.stringify(cases.map(([type]) => transport.convertBrowserMonitorEventToSpan(makeEvent(type))));
   for (const sentinel of [
     'METRIC_ID_PRIVATE_SENTINEL', 'RAW_ERROR_MESSAGE_PRIVATE_SENTINEL', 'RAW_REJECTION_PRIVATE_SENTINEL',
-    'BODY_PRIVATE_SENTINEL', 'AUTH_PRIVATE_SENTINEL', 'headers', 'body',
+    'AUTH_PRIVATE_SENTINEL', 'headers', 'body',
   ]) assert.equal(serialized.includes(sentinel), false);
 });
 
@@ -219,6 +236,12 @@ test('the converter rejects foreign service or environment and defensively drops
   }));
   assert.equal('httpStatus' in networkFailure.attributes, false);
   assert.equal(transport.convertBrowserMonitorEventToSpan(makeEvent('network_error', { durationMs: 300_001 })), undefined);
+  assert.equal(transport.convertBrowserMonitorEventToSpan(makeEvent('javascript_error', { parentSpanId: 'invalid-parent' })), undefined);
+  assert.equal(transport.convertBrowserMonitorEventToSpan(makeEvent('javascript_error', { extraField: 'not-allowlisted' })), undefined);
+  assert.equal(transport.convertBrowserMonitorEventToSpan(makeEvent('network_error', { body: 'BODY_PRIVATE_SENTINEL' })), undefined);
+  assert.equal(transport.convertBrowserMonitorEventToSpan(makeEvent('navigation', { url: 'https://private.example/path' })), undefined);
+  assert.equal(transport.convertBrowserMonitorEventToSpan(makeEvent('navigation', { parentSpanId: 'a'.repeat(32) })), undefined);
+  assert.equal(transport.convertBrowserMonitorEventToSpan(makeEvent('navigation', { spanId: 'not-a-span-id' })), undefined);
 });
 
 test('SDK page clears a disposed relay snapshot when the next session starts local-only', async () => {
@@ -399,6 +422,65 @@ test('202 sends the exact dev payload without Authorization, cookies, or extra S
   }
 });
 
+test('the real transport submits one browser navigation root and its exception child as a trace tree', async () => {
+  const calls = [];
+  const browser = installTestBrowser(async (input, init) => {
+    calls.push({ input, init });
+    return new Response(null, { status: 202 });
+  });
+  const apiUrl = apiModuleUrl();
+  const api = await import(apiUrl);
+  const transportModule = await loadTransport(apiUrl);
+  const instance = transportModule.createBrowserSpanTransport({ endpoint: '/__sdk_test__/spans' });
+  const events = [];
+  const monitor = api.initBrowserMonitoring({
+    service: 'web-sdk-demo',
+    environment: 'dev',
+    captureWebVitals: false,
+    onEvent: (event) => events.push(event),
+    transport: (event) => instance.transport(event),
+  });
+
+  try {
+    browser.window.dispatch('error', {
+      error: new TypeError('PRIVATE_BROWSER_ERROR_SENTINEL'),
+      filename: 'https://app.example.test/src/private.js?token=PRIVATE_QUERY_SENTINEL',
+      lineno: 9,
+      colno: 4,
+    });
+    await instance.flush();
+
+    assert.equal(events.length, 2);
+    assert.equal(events[0].type, 'navigation');
+    assert.equal(events[1].type, 'javascript_error');
+    assert.equal(events[1].parentSpanId, events[0].spanId);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].input, '/__sdk_test__/spans');
+    assert.equal(calls[0].init.credentials, 'omit');
+    const headers = new Headers(calls[0].init.headers);
+    assert.equal(headers.has('authorization'), false);
+    assert.equal(headers.has('x-trace-id'), false);
+
+    const payload = JSON.parse(calls[0].init.body);
+    assert.equal(payload.spans.length, 2);
+    const [root, child] = payload.spans;
+    assert.equal(root.operation, 'browser.navigation');
+    assert.equal(root.parentSpanId, undefined);
+    assert.equal(root.spanId, events[0].spanId);
+    assert.equal(child.operation, 'browser.javascript_error');
+    assert.equal(child.parentSpanId, root.spanId);
+    assert.equal(child.traceId, root.traceId);
+    const serialized = JSON.stringify(payload);
+    assert.equal(serialized.includes('PRIVATE_BROWSER_ERROR_SENTINEL'), false);
+    assert.equal(serialized.includes('PRIVATE_QUERY_SENTINEL'), false);
+    assert.equal(serialized.includes('PRIVATE_QUERY'), false);
+  } finally {
+    monitor.teardown();
+    instance.dispose();
+    browser.restore();
+  }
+});
+
 test('batch limit is 20 and immediate flush drains multiple successful batches', async () => {
   const batches = [];
   const browser = installTestBrowser(async (_input, init) => {
@@ -532,6 +614,7 @@ test('native fetch captured before SDK startup prevents failed transport request
   const api = await import(apiUrl);
   const transportModule = await loadTransport(apiUrl);
   let instance;
+  instance = transportModule.createBrowserSpanTransport({ endpoint: '/__sdk_test__/spans' });
   const events = [];
   const monitor = api.initBrowserMonitoring({
     service: 'web-sdk-demo',
@@ -540,7 +623,6 @@ test('native fetch captured before SDK startup prevents failed transport request
     onEvent: (event) => events.push(event),
     transport: (event) => instance?.transport(event),
   });
-  instance = transportModule.createBrowserSpanTransport({ endpoint: '/__sdk_test__/spans' });
   try {
     browser.window.dispatch('error', {
       error: new TypeError('PRIVATE_APPLICATION_ERROR'),
@@ -548,11 +630,11 @@ test('native fetch captured before SDK startup prevents failed transport request
       lineno: 7,
       colno: 2,
     });
-    assert.equal(events.length, 1);
+    assert.equal(events.length, 2);
     await instance.flush();
     assert.equal(fetchCalls, 1);
-    assert.equal(events.length, 1);
-    assert.equal(instance.getStatus().failedCount, 1);
+    assert.equal(events.length, 2);
+    assert.equal(instance.getStatus().failedCount, 2);
   } finally {
     monitor.teardown();
     instance.dispose();
@@ -576,11 +658,11 @@ test('api recursion fallback is limited to the exact local relay POST path', asy
   });
   try {
     await assert.rejects(globalThis.fetch('/__sdk_test__/spans', { method: 'POST' }));
-    assert.equal(events.length, 0);
+    assert.equal(events.length, 1);
     assert.equal(new Headers(fetchCalls[0].init.headers).has('x-trace-id'), false);
 
     await assert.rejects(globalThis.fetch('/__sdk_test__/spans?extra=1', { method: 'POST' }));
-    assert.equal(events.length, 1);
+    assert.equal(events.length, 2);
     assert.equal(new Headers(fetchCalls[1].init.headers).has('x-trace-id'), true);
   } finally {
     monitor.teardown();
@@ -599,15 +681,16 @@ test('transport loaded after the SDK patch still uses the underlying fetch for c
   let instance;
   const events = [];
   const relay = (event) => instance?.transport(event);
-  const monitor = api.initBrowserMonitoring({
+  const options = {
     service: 'web-sdk-demo',
     environment: 'dev',
     captureWebVitals: false,
     onEvent: (event) => events.push(event),
-    transport: relay,
-  });
+  };
+  const monitor = api.initBrowserMonitoring(options);
   const transportModule = await loadTransport(apiUrl);
   instance = transportModule.createBrowserSpanTransport({ endpoint: '/custom-bff/spans' });
+  monitor.start({ ...options, transport: relay });
   try {
     browser.window.dispatch('error', {
       error: new TypeError('PRIVATE_APPLICATION_ERROR'),
@@ -619,11 +702,11 @@ test('transport loaded after the SDK patch still uses the underlying fetch for c
     assert.equal(fetchCalls.length, 1);
     assert.equal(fetchCalls[0].input, '/custom-bff/spans');
     assert.equal(new Headers(fetchCalls[0].init.headers).has('x-trace-id'), false);
-    assert.equal(events.length, 1);
-    assert.equal(instance.getStatus().failedCount, 1);
+    assert.equal(events.length, 2);
+    assert.equal(instance.getStatus().failedCount, 2);
 
     await assert.rejects(globalThis.fetch('/__sdk_test__/spans/other', { method: 'POST' }));
-    assert.equal(events.length, 2);
+    assert.equal(events.length, 3);
   } finally {
     monitor.teardown();
     instance.dispose();
