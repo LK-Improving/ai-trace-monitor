@@ -39,6 +39,7 @@ const alertItem = {
 };
 const listPayload = { items: [alertItem], total: 1, page: 2, pageSize: 20 };
 const summaryPayload = { total: 8, active: 3, acknowledged: 2, resolved: 3, criticalActive: 1 };
+const window = { from: '2026-10-01T00:00:00.000Z', to: '2026-10-02T00:00:00.000Z' };
 
 test('alert list request scopes project/environment and serializes filters and pagination', async () => {
   const originalFetch = globalThis.fetch;
@@ -53,9 +54,9 @@ test('alert list request scopes project/environment and serializes filters and p
 
   try {
     const result = await alerts.fetchAlerts({
-      projectId, environment: 'staging', state: 'active', level: 'critical', page: 2, pageSize: 20,
+      projectId, environment: 'staging', state: 'active', level: 'critical', page: 2, pageSize: 20, ...window,
     }, controller.signal);
-    assert.equal(requestedUrl, `/api/v1/alerts?projectId=${projectId}&environment=staging&state=active&level=critical&page=2&pageSize=20`);
+    assert.equal(requestedUrl, `/api/v1/alerts?projectId=${projectId}&environment=staging&state=active&level=critical&page=2&pageSize=20&from=${encodeURIComponent(window.from)}&to=${encodeURIComponent(window.to)}`);
     assert.equal(requestInit.signal, controller.signal);
     assert.deepEqual(result.items, [alertItem]);
     assert.equal(result.total, 1);
@@ -73,8 +74,8 @@ test('summary request uses the selected project and environment', async () => {
   };
 
   try {
-    assert.deepEqual(await alerts.fetchAlertSummary(projectId, 'prod'), summaryPayload);
-    assert.equal(requestedUrl, `/api/v1/alerts/summary?projectId=${projectId}&environment=prod`);
+    assert.deepEqual(await alerts.fetchAlertSummary(projectId, 'prod', window), summaryPayload);
+    assert.equal(requestedUrl, `/api/v1/alerts/summary?projectId=${projectId}&environment=prod&from=${encodeURIComponent(window.from)}&to=${encodeURIComponent(window.to)}`);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -121,10 +122,11 @@ test('invalid filters and unsupported states fail before making a request', asyn
 
   try {
     await assert.rejects(alerts.fetchAlerts({
-      projectId: 'not-a-uuid', environment: 'dev', state: 'all', level: 'all', page: 1, pageSize: 20,
+      projectId: 'not-a-uuid', environment: 'dev', state: 'all', level: 'all', page: 1, pageSize: 20, ...window,
     }), /Invalid alert filters/);
     await assert.rejects(alerts.updateAlertState(alertId, 'muted'), /Invalid alert state update/);
-    await assert.rejects(alerts.fetchAlertSummary(projectId, 'development'), /Invalid alert summary filters/);
+    await assert.rejects(alerts.fetchAlertSummary(projectId, 'development', window), /Invalid alert summary filters/);
+    await assert.rejects(alerts.fetchAlertSummary(projectId, 'dev', { from: window.to, to: window.from }), /Invalid alert summary filters/);
     assert.equal(requestCount, 0);
   } finally {
     globalThis.fetch = originalFetch;
@@ -136,14 +138,14 @@ test('API and network errors stay explicit and do not expose backend details', a
   globalThis.fetch = async () => new Response(JSON.stringify({ message: 'sensitive backend detail' }), { status: 401 });
 
   try {
-    await assert.rejects(alerts.fetchAlertSummary(projectId, 'all'), (error) => {
+    await assert.rejects(alerts.fetchAlertSummary(projectId, 'all', window), (error) => {
       assert.equal(error.status, 401);
       assert.match(error.message, /PLATFORM_ADMIN_TOKEN/);
       assert.doesNotMatch(error.message, /sensitive backend detail/);
       return true;
     });
     globalThis.fetch = async () => { throw new TypeError('network internals'); };
-    await assert.rejects(alerts.fetchAlertSummary(projectId, 'all'), /无法连接告警 API 服务/);
+    await assert.rejects(alerts.fetchAlertSummary(projectId, 'all', window), /无法连接告警 API 服务/);
   } finally {
     globalThis.fetch = originalFetch;
   }

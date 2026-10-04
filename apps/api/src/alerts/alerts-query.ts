@@ -54,8 +54,25 @@ function parsePositiveInteger(value: unknown, fallback: number, maximum: number)
   return parsed;
 }
 
+function parseWindow(query: Record<string, unknown>): { from?: string; to?: string } {
+  if (query.from === undefined && query.to === undefined) return {};
+  if (typeof query.from !== 'string' || typeof query.to !== 'string'
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(query.from)
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(query.to)) {
+    throw new BadRequestException('Invalid alerts query');
+  }
+  const from = Date.parse(query.from);
+  const to = Date.parse(query.to);
+  if (!Number.isFinite(from) || !Number.isFinite(to)
+    || new Date(from).toISOString() !== query.from || new Date(to).toISOString() !== query.to
+    || from >= to || to - from > 30 * 24 * 60 * 60 * 1000) {
+    throw new BadRequestException('Invalid alerts query');
+  }
+  return { from: query.from, to: query.to };
+}
+
 export function parseAlertsListQuery(raw: unknown) {
-  const query = asQueryRecord(raw, ['projectId', 'environment', 'state', 'level', 'page', 'pageSize']);
+  const query = asQueryRecord(raw, ['projectId', 'environment', 'state', 'level', 'page', 'pageSize', 'from', 'to']);
   const page = parsePositiveInteger(query.page, 1, 1_000_000);
   const pageSize = parsePositiveInteger(query.pageSize, 20, 100);
   const offset = (page - 1) * pageSize;
@@ -71,14 +88,16 @@ export function parseAlertsListQuery(raw: unknown) {
     page,
     pageSize,
     offset,
+    ...parseWindow(query),
   };
 }
 
 export function parseAlertsSummaryQuery(raw: unknown) {
-  const query = asQueryRecord(raw, ['projectId', 'environment']);
+  const query = asQueryRecord(raw, ['projectId', 'environment', 'from', 'to']);
   return {
     projectId: parseProjectId(query.projectId),
     environment: parseEnum(query.environment, ALERT_ENVIRONMENTS, 'all'),
+    ...parseWindow(query),
   };
 }
 

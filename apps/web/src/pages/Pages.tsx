@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Icon, PageIntro, PanelHeading, StatusPill } from '../components/ui';
 import type { OverviewEnvironment, OverviewRange, OverviewResponse, OverviewService, OverviewSeriesPoint } from '../overview-api';
 import type { TraceListResponse, TraceEnvironment, TimeWindow } from '../chain-api';
+import { createTimeWindow } from '../chain-api';
 import { getQuickstartSnippet } from '../quickstart';
 import { AlertNotificationSettings } from './AlertNotificationSettings';
 import { ProjectCredentialsSettings, ProjectPrivacySettings, ProjectServicesSettings } from './ProjectSettingsPanels';
@@ -134,6 +135,7 @@ export function OverviewPage({
   range,
   empty,
   onRetry,
+  onCreateProject,
   onSelectTrace,
 }: {
   status: 'loading-projects' | 'project-error' | 'no-projects' | 'loading' | 'error' | 'ready';
@@ -144,13 +146,14 @@ export function OverviewPage({
   range: OverviewRange;
   empty: boolean;
   onRetry: () => void;
+  onCreateProject: () => void;
   onSelectTrace: (id: string, environment: TraceEnvironment, window: TimeWindow) => void;
 }) {
   const metric = status === 'ready' ? data?.metrics : undefined;
   const statusCopy: Record<typeof status, string> = {
     'loading-projects': '正在读取项目列表…',
     'project-error': errorMessage ?? '项目列表加载失败。',
-    'no-projects': '当前没有可用项目，请先配置项目后再查看监控数据。',
+    'no-projects': '当前没有可用项目。创建项目后即可注册服务并接入第一条 Trace。',
     loading: '正在加载所选项目的 Overview 数据…',
     error: errorMessage ?? 'Overview 数据加载失败。',
     ready: empty ? '该项目、环境与时间范围内暂无观测数据。' : '',
@@ -164,7 +167,7 @@ export function OverviewPage({
   return <>
     {statusCopy[status] && <div className={`overview-status ${isError ? 'error' : status === 'ready' ? 'empty' : 'info'}`} role={isError ? 'alert' : 'status'} aria-live="polite">
       <span>{statusCopy[status]}</span>
-      {canRetry && <button className="text-action" type="button" onClick={onRetry}>{status === 'no-projects' ? '重新加载项目' : '重试'}<Icon name="arrow" size={14} /></button>}
+      <span className="project-gate-actions">{status === 'no-projects' && <button className="button primary compact" type="button" onClick={onCreateProject}>创建项目</button>}{canRetry && <button className="text-action" type="button" onClick={onRetry}>{status === 'no-projects' ? '重新加载项目' : '重试'}<Icon name="arrow" size={14} /></button>}</span>
     </div>}
 
     <section className="metric-grid" aria-label="关键指标" aria-busy={status === 'loading' || status === 'loading-projects'}>
@@ -243,11 +246,13 @@ function alertAction(alert: AlertItem): { state: AlertState; label: string }[] {
 export function AlertsPage({
   projectId,
   environment,
+  range,
   onNotify,
   onSelectTrace,
 }: {
   projectId: string;
   environment: OverviewEnvironment;
+  range: OverviewRange;
   onNotify: (message: string) => void;
   onSelectTrace: (traceId: string, environment: TraceEnvironment, lastSeenAt: string) => void;
 }) {
@@ -259,11 +264,12 @@ export function AlertsPage({
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [pendingAlertId, setPendingAlertId] = useState<string | null>(null);
   const [actionError, setActionError] = useState('');
+  const [window, setWindow] = useState(() => createTimeWindow(range));
   const [listState, setListState] = useState<AlertLoadState<AlertListResponse>>({ scopeKey: '', status: 'loading' });
   const [summaryState, setSummaryState] = useState<AlertLoadState<AlertSummary>>({ scopeKey: '', status: 'loading' });
 
-  const listScopeKey = JSON.stringify([projectId, environment, stateFilter, levelFilter, page, listRetry, refreshVersion]);
-  const summaryScopeKey = JSON.stringify([projectId, environment, summaryRetry, refreshVersion]);
+  const listScopeKey = JSON.stringify([projectId, environment, window.from, window.to, stateFilter, levelFilter, page, listRetry, refreshVersion]);
+  const summaryScopeKey = JSON.stringify([projectId, environment, window.from, window.to, summaryRetry, refreshVersion]);
   const listScopeRef = useRef(listScopeKey);
   const summaryScopeRef = useRef(summaryScopeKey);
   listScopeRef.current = listScopeKey;
@@ -273,7 +279,7 @@ export function AlertsPage({
     const controller = new AbortController();
     const scopeKey = listScopeKey;
     setListState({ scopeKey, status: 'loading' });
-    fetchAlerts({ projectId, environment, state: stateFilter, level: levelFilter, page, pageSize: 20 }, controller.signal)
+    fetchAlerts({ projectId, environment, state: stateFilter, level: levelFilter, page, pageSize: 20, ...window }, controller.signal)
       .then((data) => {
         if (!controller.signal.aborted && listScopeRef.current === scopeKey) setListState({ scopeKey, status: 'ready', data });
       })
@@ -283,13 +289,13 @@ export function AlertsPage({
         }
       });
     return () => controller.abort();
-  }, [projectId, environment, stateFilter, levelFilter, page, listRetry, refreshVersion, listScopeKey]);
+  }, [projectId, environment, window, stateFilter, levelFilter, page, listRetry, refreshVersion, listScopeKey]);
 
   useEffect(() => {
     const controller = new AbortController();
     const scopeKey = summaryScopeKey;
     setSummaryState({ scopeKey, status: 'loading' });
-    fetchAlertSummary(projectId, environment, controller.signal)
+    fetchAlertSummary(projectId, environment, window, controller.signal)
       .then((data) => {
         if (!controller.signal.aborted && summaryScopeRef.current === scopeKey) setSummaryState({ scopeKey, status: 'ready', data });
       })
@@ -299,7 +305,7 @@ export function AlertsPage({
         }
       });
     return () => controller.abort();
-  }, [projectId, environment, summaryRetry, refreshVersion, summaryScopeKey]);
+  }, [projectId, environment, window, summaryRetry, refreshVersion, summaryScopeKey]);
 
   const visibleList: AlertLoadState<AlertListResponse> = listState.scopeKey === listScopeKey
     ? listState
@@ -340,14 +346,14 @@ export function AlertsPage({
 
   const emptyMessage = summary && summary.total > 0
     ? '当前状态和级别筛选下没有告警。'
-    : '当前项目与环境范围内暂无告警。';
+    : '当前项目、环境与时间范围内暂无告警。';
 
   return <section className="module-page alerts-page">
-    <PageIntro eyebrow="ALERTS / INCIDENTS" title="把异常跟进到有结论。" description="查看服务端内置规则产生的告警，并从告警直接定位关联 Trace。列表和统计随当前项目与环境更新。" />
+    <PageIntro eyebrow="ALERTS / INCIDENTS" title="把异常跟进到有结论。" description="查看服务端内置规则产生的告警，并从告警直接定位关联 Trace。列表与统计按最近发生时间匹配当前项目、环境和时间范围。" />
 
     {visibleSummary.status === 'error' && <div className="alert-load-error summary-error" role="alert"><span>{visibleSummary.message}</span><button className="text-action" type="button" onClick={() => setSummaryRetry((count) => count + 1)}>重试<Icon name="arrow" size={14} /></button></div>}
     <div className="alert-summary-grid" aria-busy={visibleSummary.status === 'loading'}>
-      <AlertSummaryCard label="告警总数" value={summary ? formatCount(summary.total) : visibleSummary.status === 'loading' ? '…' : '—'} note="当前项目 / 环境" />
+      <AlertSummaryCard label="告警总数" value={summary ? formatCount(summary.total) : visibleSummary.status === 'loading' ? '…' : '—'} note={`最近发生 · ${getRangeLabel(range)}`} />
       <AlertSummaryCard label="待确认" value={summary ? formatCount(summary.active) : visibleSummary.status === 'loading' ? '…' : '—'} note="等待处理" />
       <AlertSummaryCard label="处理中" value={summary ? formatCount(summary.acknowledged) : visibleSummary.status === 'loading' ? '…' : '—'} note="已确认" />
       <AlertSummaryCard label="严重待确认" value={summary ? formatCount(summary.criticalActive) : visibleSummary.status === 'loading' ? '…' : '—'} note="优先跟进" tone="critical" />
@@ -370,7 +376,8 @@ export function AlertsPage({
             <option value="all">全部级别</option><option value="critical">严重</option><option value="warning">警告</option><option value="info">提示</option>
           </select></label>
         </div>
-        <span className="alert-scope-label">{environment === 'all' ? '全部环境' : environment} · 每页 20 条</span>
+        <span className="alert-scope-label">{environment === 'all' ? '全部环境' : environment} · 最近发生于{getRangeLabel(range)} · 每页 20 条</span>
+        <button className="text-action" type="button" onClick={() => { setPage(1); setWindow(createTimeWindow(range)); }}>刷新时间窗口<Icon name="arrow" size={14} /></button>
       </div>
 
       {actionError && <div className="alert-load-error alert-action-error" role="alert"><span>{actionError}</span></div>}
@@ -397,16 +404,20 @@ export function AlertsPage({
   </section>;
 }
 
-export function SettingsPage({ projectId, projectName: currentProjectName, environment, onNotify, onDataSourceChange }: {
+export function SettingsPage({ projectId, projectName: currentProjectName, environment, onboarding, onFinishOnboarding, onOpenDocs, onNotify, onDataSourceChange }: {
   projectId: string;
   projectName: string;
   environment: OverviewEnvironment;
+  onboarding: boolean;
+  onFinishOnboarding: () => void;
+  onOpenDocs: () => void;
   onNotify: (message: string) => void;
   onDataSourceChange: (usesApi: boolean) => void;
 }) {
-  const [tab, setTab] = useState<SettingsTab>('project');
+  const [tab, setTab] = useState<SettingsTab>(onboarding ? 'services' : 'project');
   const tabs: { id: SettingsTab; label: string }[] = [{ id: 'project', label: '项目概况' }, { id: 'services', label: '服务与环境' }, { id: 'privacy', label: '采集与脱敏' }, { id: 'retention', label: '数据保留' }, { id: 'access', label: '接入凭证' }, { id: 'notifications', label: '告警通知' }];
   return <section className="module-page settings-page">
+    {onboarding && <section className="project-onboarding panel" aria-label="项目接入引导"><div><strong>项目已创建：完成接入</strong><p>先注册要上报的服务和环境，再签发仅有 spans:write 权限的凭证。凭证仅显示一次，请保存在服务端。最后按接入文档发送首条 Trace，并在总览或 Trace 检索确认数据。</p></div><div className="project-onboarding-actions"><button className="button secondary compact" type="button" onClick={() => { setTab('services'); onDataSourceChange(true); }}>1 注册服务</button><button className="button secondary compact" type="button" onClick={() => { setTab('access'); onDataSourceChange(true); }}>2 创建写入凭证</button><button className="button secondary compact" type="button" onClick={onOpenDocs}>3 查看上报示例</button><button className="text-action" type="button" onClick={onFinishOnboarding}>收起引导</button></div></section>}
     {tab !== 'notifications' && <PageIntro eyebrow="PROJECT / CONFIGURATION" title="项目边界与数据策略。" description="管理服务接入、敏感字段脱敏策略、凭证权限与配置审计。涉及持久化的设置均由项目 API 确认后生效。" />}
     <div className="settings-tabs" role="tablist" aria-label="项目设置分类">{tabs.map((item) => <button key={item.id} role="tab" aria-selected={tab === item.id} className={tab === item.id ? 'active' : ''} type="button" onClick={() => { setTab(item.id); onDataSourceChange(isApiBackedSettingsTab(item.id)); }}>{item.label}</button>)}</div>
     {tab === 'project' && <div className="settings-content-grid"><section className="panel settings-card"><div className="panel-heading"><div><h2>项目基本信息</h2><small>当前工作区上下文；项目资料暂不在此页面编辑。</small></div><span className="settings-status">READ ONLY</span></div><div className="form-grid"><label className="form-field">项目名称<input value={currentProjectName} readOnly /></label><label className="form-field">项目标识<input value={projectId} readOnly /></label></div><div className="panel-bottom-note">服务与环境可在“服务与环境”中按项目注册和管理。</div></section><section className="panel settings-card"><div className="panel-heading"><div><h2>项目安全边界</h2><small>项目配置均按当前项目 ID 请求，不显示其他项目记录。</small></div></div><div className="setting-list"><div className="setting-item"><div><strong>项目凭证</strong><p>支持按写入 Span 与读取 Trace 分配最小权限。</p></div><span className="policy-chip">项目隔离</span></div><div className="setting-item"><div><strong>敏感内容</strong><p>Prompt / Response 原文采集固定关闭，不会由前端切换开启。</p></div><span className="policy-chip disabled">默认关闭</span></div></div></section></div>}

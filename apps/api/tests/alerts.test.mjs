@@ -17,6 +17,8 @@ const { RequestMethod } = require('@nestjs/common');
 
 const projectId = 'b35a64bb-8a12-4806-9e77-8831870a5dd0';
 const alertId = '2f7b10f4-f8bb-4a80-9711-164cc2797c84';
+const from = '2026-10-01T00:00:00.000Z';
+const to = '2026-10-02T00:00:00.000Z';
 const row = {
   id: alertId,
   title: 'Span 执行错误',
@@ -67,6 +69,8 @@ test('告警查询使用固定枚举、默认值和有界分页', () => {
     projectId,
     environment: 'prod',
   });
+  assert.deepEqual(parseAlertsListQuery({ projectId, from, to }).from, from);
+  assert.deepEqual(parseAlertsSummaryQuery({ projectId, from, to }).to, to);
   assert.equal(parseAlertId(alertId.toUpperCase()), alertId);
   assert.equal(parseAlertState({ state: 'active' }), 'active');
 });
@@ -84,8 +88,13 @@ test('告警查询拒绝未知参数、数组值、非法状态和越界分页',
     { projectId, pageSize: '101' },
     { projectId, page: '1000000', pageSize: '100' },
     { projectId, debug: 'true' },
+    { projectId, from },
+    { projectId, from: to, to: from },
+    { projectId, from: '2026-09-01T00:00:00.000Z', to },
+    { projectId, from: '2026-10-01T00:00:00+00:00', to },
   ]) assertBadRequest(() => parseAlertsListQuery(query));
   assertBadRequest(() => parseAlertsSummaryQuery({ projectId, page: '1' }));
+  assertBadRequest(() => parseAlertsSummaryQuery({ projectId, to }));
   assertBadRequest(() => parseAlertId('not-a-uuid'));
   for (const body of [null, {}, { state: 'open' }, { state: 'resolved', extra: true }]) {
     assertBadRequest(() => parseAlertState(body));
@@ -145,8 +154,9 @@ test('列表过滤 project/environment/state/level 并返回严格分页契约',
     page: 2,
     pageSize: 10,
   });
-  assert.deepEqual(calls[1].values, [projectId, 'dev', 'active', 'critical']);
-  assert.deepEqual(calls[2].values, [projectId, 'dev', 'active', 'critical', 10, 10]);
+  assert.deepEqual(calls[1].values, [projectId, 'dev', 'active', 'critical', null, null]);
+  assert.deepEqual(calls[2].values, [projectId, 'dev', 'active', 'critical', null, null, 10, 10]);
+  assert.match(calls[2].sql, /last_seen_at >= \$5::timestamptz/);
 });
 
 test('summary 同项目和环境聚合所有状态及 critical active', async () => {
@@ -160,7 +170,30 @@ test('summary 同项目和环境聚合所有状态及 critical active', async ()
   };
   const response = await new AlertsService(database).summary({ projectId, environment: 'staging' });
   assert.deepEqual(response, { total: 7, active: 2, acknowledged: 3, resolved: 2, criticalActive: 1 });
-  assert.deepEqual(calls[1].values, [projectId, 'staging']);
+  assert.deepEqual(calls[1].values, [projectId, 'staging', null, null]);
+});
+
+test('告警列表与统计按最近发生时间使用同一半开窗口', async () => {
+  const calls = [];
+  const database = {
+    async query(sql, values) {
+      calls.push({ sql, values });
+      if (sql.includes('FROM projects')) return { rows: [{ id: projectId }] };
+      if (sql.includes('critical_active')) return { rows: [{ total: '0', active: '0', acknowledged: '0', resolved: '0', critical_active: '0' }] };
+      if (sql.includes('count(*) AS total')) return { rows: [{ total: '0' }] };
+      return { rows: [] };
+    },
+  };
+  const service = new AlertsService(database);
+  await service.list({ projectId, from, to });
+  await service.summary({ projectId, from, to });
+  const filtered = calls.filter(({ sql }) => sql.includes('FROM alert_incidents'));
+  assert.equal(filtered.length, 3);
+  for (const { sql, values } of filtered) {
+    assert.match(sql, /last_seen_at >= \$\d+::timestamptz/);
+    assert.match(sql, /last_seen_at < \$\d+::timestamptz/);
+    assert.deepEqual(values.filter((value) => value === from || value === to), [from, to]);
+  }
 });
 
 test('状态 API 通过 scope 锁序列化状态更新并支持重新打开', async () => {

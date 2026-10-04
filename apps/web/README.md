@@ -2,7 +2,7 @@
 
 Docs 页的 Node.js 示例集中导出为 `NODE_QUICKSTART`，浏览器示例为 `BROWSER_QUICKSTART`，来源是 `src/quickstart.ts`。Node.js 18+ 可直接用原生 `fetch`，不需要安装或导入 SDK。将 Node 示例保存为 `quickstart.mjs` 后执行 `node quickstart.mjs`。
 
-运行前配置 `TRACE_OPS_PROJECT_KEY`、`TRACE_OPS_SERVICE` 和 `TRACE_OPS_ENVIRONMENT`，并确认 service/environment 已在隔离项目中注册。模板默认使用 `customer-api` / `dev`；`TRACE_OPS_ENDPOINT` 可选，默认 `http://localhost:3001/api/v1/spans`。环境只接受 `dev`、`staging`、`prod`。项目创建、服务注册和密钥签发方法见 [`apps/api/README.md` 的管理 API](../api/README.md#管理-api)；这些管理路由需要可信服务端的管理员令牌。
+运行前配置 `TRACE_OPS_PROJECT_KEY`、`TRACE_OPS_SERVICE` 和 `TRACE_OPS_ENVIRONMENT`，并确认 service/environment 已在隔离项目中注册。模板默认使用 `customer-api` / `dev`；`TRACE_OPS_ENDPOINT` 可选，默认 `http://localhost:3001/api/v1/spans`。环境只接受 `dev`、`staging`、`prod`。本地开发控制台可从“创建项目”入口新建项目，并按“注册服务 → 创建 spans:write 凭证 → 发送首条 Trace”的引导完成接入；也可使用 [`apps/api/README.md` 的管理 API](../api/README.md#管理-api)。管理请求仍由本机 Vite 代理在服务端附加管理员令牌，凭证不进入浏览器 Bundle。
 
 此请求把 `projectKey` 放在 JSON body，不放在 header；批次 `environment` 与每个 Span 的 `service` 需要匹配已注册绑定。Span 使用 `traceId`、`spanId`、可选 `parentSpanId`、`service`、`operation`、`startTime`、`endTime`、`status` 和 `attributes`。服务端补充 `projectId` 与 `schemaVersion`。HTTP 202 表示 API 有界内存队列已接受，不表示已持久写入 Kafka 或 ClickHouse。
 

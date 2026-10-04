@@ -9,6 +9,7 @@ import {
   validateAlertStateBody,
   validateLocalSameOrigin,
   validateProjectKeyBody,
+  validateProjectCreateBody,
   validateProjectPrivacyBody,
   validateProjectServiceBody,
 } from '../src/admin-proxy-runtime.mjs';
@@ -383,6 +384,8 @@ test('alert list and summary query validators accept only the shared contract fi
   assert.equal(validateAdminQuery(list,
     `projectId=${projectId}&environment=all&state=acknowledged&level=critical&page=2&pageSize=20`).valid, true);
   assert.equal(validateAdminQuery(summary, `projectId=${projectId}&environment=prod`).valid, true);
+  assert.equal(validateAdminQuery(list, `projectId=${projectId}&environment=prod&from=${encodeURIComponent(startTime)}&to=${encodeURIComponent(endTime)}`).valid, true);
+  assert.equal(validateAdminQuery(summary, `projectId=${projectId}&environment=prod&from=${encodeURIComponent(startTime)}&to=${encodeURIComponent(endTime)}`).valid, true);
   assert.equal(validateAdminQuery(list,
     `projectId=${projectId}&environment=dev&page=501&pageSize=20`).valid, true, 'offset 10,000 is the inclusive boundary');
 
@@ -395,8 +398,15 @@ test('alert list and summary query validators accept only the shared contract fi
     `projectId=${projectId}&environment=dev&page=1001`,
     `projectId=${projectId}&environment=dev&page=502&pageSize=20`,
     `projectId=${projectId}&environment=dev&debug=true`,
+    `projectId=${projectId}&environment=dev&from=${encodeURIComponent(startTime)}`,
   ]) assert.equal(validateAdminQuery(list, query).valid, false, query);
   assert.equal(validateAdminQuery(summary, `projectId=${projectId}&environment=all&state=active`).valid, false);
+});
+
+test('project creation proxy accepts only the expected project fields', () => {
+  assert.equal(validateProjectCreateBody(JSON.stringify({ name: '智能客服', slug: 'assistant-demo', retentionDays: 30 })).valid, true);
+  assert.equal(validateProjectCreateBody(JSON.stringify({ name: 'bad', slug: '../bad', retentionDays: 30 })).valid, undefined);
+  assert.equal(validateProjectCreateBody(JSON.stringify({ name: 'bad', slug: 'demo', retentionDays: 30, admin: true })).valid, undefined);
 });
 
 test('notification proxy recognizes only exact scoped routes and contract-shaped inputs', () => {
@@ -679,6 +689,7 @@ test('middleware forwards only the exact same-origin alert state PATCH with a no
 test('project configuration proxy forwards only scoped routes and validated bodies with the server credential', async () => {
   const beforeCount = upstreamRequests.length;
   const calls = [
+    { path: '/api/v1/projects', method: 'POST', body: { name: '智能客服', slug: 'assistant-demo', retentionDays: 30 } },
     { path: `/api/v1/projects/${projectId}/services`, method: 'GET' },
     { path: `/api/v1/projects/${projectId}/privacy`, method: 'GET' },
     { path: `/api/v1/projects/${projectId}/keys`, method: 'GET' },
@@ -792,7 +803,7 @@ test('middleware rejects every other PATCH route, query, origin, and body before
 test('middleware blocks POST, unknown query fields, includeContent=true, and non-admin SDK paths', async () => {
   const beforeCount = upstreamRequests.length;
   const post = await get('/api/v1/projects', { method: 'POST', headers: localHeaders(), body: '{}' });
-  assert.equal(post.status, 405);
+  assert.equal(post.status, 400);
   const unknown = await get(`/api/v1/metrics/ai?projectId=${projectId}&includeContent=true`, { headers: localHeaders() });
   assert.equal(unknown.status, 400);
   const content = await get(`/api/v1/traces/trace_v1_abc?projectId=${projectId}&environment=dev&includeContent=true`, { headers: localHeaders() });

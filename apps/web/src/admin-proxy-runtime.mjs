@@ -7,6 +7,7 @@ const MAX_ALERT_STATE_BODY_BYTES = 1024;
 const MAX_ALERT_CHANNEL_BODY_BYTES = 8192;
 const MAX_ALERT_ACTION_BODY_BYTES = 512;
 const MAX_PROJECT_SERVICE_BODY_BYTES = 1024;
+const MAX_PROJECT_CREATE_BODY_BYTES = 1024;
 const MAX_PROJECT_KEY_BODY_BYTES = 4096;
 const MAX_PROJECT_PRIVACY_BODY_BYTES = 32 * 1024;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -77,6 +78,11 @@ const SAFE_ERRORS = {
     status: 400,
     error: 'invalid_project_service_body',
     message: '服务请求体必须只包含有效的 name 与 environment。',
+  },
+  invalidProjectCreateBody: {
+    status: 400,
+    error: 'invalid_project_create_body',
+    message: '项目请求体必须包含有效的名称、标识和保留天数。',
   },
   invalidProjectPrivacyBody: {
     status: 400,
@@ -322,7 +328,7 @@ function validTraceDetailQuery(route, query) {
 }
 
 function validAlertListQuery(query) {
-  const allowed = new Set(['projectId', 'environment', 'state', 'level', 'page', 'pageSize']);
+  const allowed = new Set(['projectId', 'environment', 'state', 'level', 'page', 'pageSize', 'from', 'to']);
   if (!hasOnlyKeys(query, allowed) || !UUID_PATTERN.test(query.get('projectId') ?? '')) return false;
 
   const environment = query.get('environment');
@@ -330,6 +336,8 @@ function validAlertListQuery(query) {
   const state = query.get('state') ?? 'all';
   const level = query.get('level') ?? 'all';
   if (!ALERT_STATES.has(state) || !ALERT_LEVELS.has(level)) return false;
+  if (query.has('from') !== query.has('to')
+    || (query.has('from') && !validWindow(query.get('from'), query.get('to')))) return false;
 
   const page = query.get('page') ?? '1';
   const pageSize = query.get('pageSize') ?? '20';
@@ -338,10 +346,12 @@ function validAlertListQuery(query) {
 }
 
 function validAlertSummaryQuery(query) {
-  const allowed = new Set(['projectId', 'environment']);
+  const allowed = new Set(['projectId', 'environment', 'from', 'to']);
   return hasOnlyKeys(query, allowed)
     && UUID_PATTERN.test(query.get('projectId') ?? '')
-    && OVERVIEW_ENVIRONMENTS.has(query.get('environment'));
+    && OVERVIEW_ENVIRONMENTS.has(query.get('environment'))
+    && query.has('from') === query.has('to')
+    && (!query.has('from') || validWindow(query.get('from'), query.get('to')));
 }
 
 function validProjectQuery(query) {
@@ -433,7 +443,12 @@ function parseStrictJsonObject(rawBody, maximumBytes) {
       } else if (rawBody.startsWith('false', index)) {
         value = false;
         index += 5;
-      } else return undefined;
+      } else {
+        const number = rawBody.slice(index).match(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/);
+        if (!number) return undefined;
+        value = Number(number[0]);
+        index += number[0].length;
+      }
       if (value === undefined) return undefined;
       result[key] = value;
       skipWhitespace();
@@ -520,6 +535,18 @@ export function validateProjectServiceBody(rawBody) {
     && validChannelName(body.name) && ENVIRONMENTS.has(body.environment)
     ? { valid: true, value: { name: body.name, environment: body.environment } }
     : SAFE_ERRORS.invalidProjectServiceBody;
+}
+
+export function validateProjectCreateBody(rawBody) {
+  const body = parseStrictJsonObject(rawBody, MAX_PROJECT_CREATE_BODY_BYTES);
+  return body && Object.keys(body).length === 3
+    && Object.keys(body).every((key) => ['name', 'slug', 'retentionDays'].includes(key))
+    && validChannelName(body.name)
+    && typeof body.slug === 'string' && body.slug.length <= 120
+    && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(body.slug)
+    && Number.isInteger(body.retentionDays) && body.retentionDays >= 1 && body.retentionDays <= 3650
+    ? { valid: true, value: { name: body.name, slug: body.slug, retentionDays: body.retentionDays } }
+    : SAFE_ERRORS.invalidProjectCreateBody;
 }
 
 export function validateProjectPrivacyBody(rawBody) {
@@ -988,7 +1015,7 @@ export function createAdminProxy(options = {}) {
       return;
     }
 
-    const allowedMethods = inspected.route.name === 'projectServices' ? ['GET', 'POST']
+    const allowedMethods = inspected.route.name === 'projects' || inspected.route.name === 'projectServices' ? ['GET', 'POST']
       : inspected.route.name === 'projectPrivacy' ? ['GET', 'PATCH']
         : inspected.route.name === 'projectKeys' ? ['GET', 'POST']
           : inspected.route.name === 'projectKey' ? ['DELETE']
@@ -1053,6 +1080,10 @@ export function createAdminProxy(options = {}) {
     }
     if (request.method === 'POST' && inspected.route.name === 'projectServices') {
       readAndForward(MAX_PROJECT_SERVICE_BODY_BYTES, SAFE_ERRORS.invalidProjectServiceBody, validateProjectServiceBody);
+      return;
+    }
+    if (request.method === 'POST' && inspected.route.name === 'projects') {
+      readAndForward(MAX_PROJECT_CREATE_BODY_BYTES, SAFE_ERRORS.invalidProjectCreateBody, validateProjectCreateBody);
       return;
     }
     if (request.method === 'PATCH' && inspected.route.name === 'projectPrivacy') {

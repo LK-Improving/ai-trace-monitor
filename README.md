@@ -98,7 +98,7 @@ Compose 中的凭证仅供绑定到 localhost 的个人开发环境使用；不�
 
 总览、最新 Trace、Trace 检索/详情执行树、模型用量和 RAG 指标已接真实接口。全局项目、环境和时间范围切换会取消旧请求；空数据、加载和失败重试明确显示，不回退成演示数据。详情提示查询窗口、孤儿/环、多根及 2,000 Span 截断；未观测到的 usage/TTFT 显示“—”。保持原有浅暖白页面样式。
 
-本地 Web 通过 Vite 服务端读取 `PLATFORM_ADMIN_TOKEN`，仅转发严格白名单中的同源、loopback 管理查询和告警通知操作；不要放入 `VITE_*`、URL 或浏览器存储。修改 `.env` 后重启 Web。该代理不用于 preview/生产，也不替代正式登录和项目成员 RBAC。告警通知及投递历史已接真实 API；其余演示设置、价格、评估与生产权限仍需后续实现。
+本地 Web 通过 Vite 服务端读取 `PLATFORM_ADMIN_TOKEN`，仅转发严格白名单中的同源、loopback 管理查询、项目创建/配置和告警通知操作；不要放入 `VITE_*`、URL 或浏览器存储。修改 `.env` 后重启 Web。该代理不用于 preview/生产，也不替代正式登录和项目成员 RBAC。控制台可创建项目并引导服务注册、写入凭证和首条 Trace 接入；告警列表与统计按最近发生时间匹配顶部 1h/24h/7d 范围，窗口为左闭右开，切换范围或手动刷新时重新计算。告警通知及投递历史已接真实 API；其余演示设置、价格、评估与生产权限仍需后续实现。
 
 本地端到端验收先运行 `pnpm build`，启动 Compose，然后设置 `$env:TRACE_OPS_RUN_INTEGRATION='1'` 并运行 `node scripts/w18-page-acceptance-session.cjs`（保持终端开启）。脚本输出随机 `webUrl`；另一个终端使用 Playwright CLI 打开该 URL，再运行 `scripts/w18-browser-acceptance.js`。将 CLI 返回的 Result JSON 保存为 `output/acceptance/w18-browser-result.json`，回到验收终端输入 `verify`，继续回查入库结果并自动清理。未完成时输入 `finish`，报告失败并清理；30 分钟超时也会清理。请串行运行，不同时启动多个 W18 验收会话。
 
@@ -106,7 +106,7 @@ Compose 中的凭证仅供绑定到 localhost 的个人开发环境使用；不�
 
 浏览器成功读取均来自真实 API；只在加载/错误/竞态测试时注入网络故障。独立本地协议服务替代付费模型/Qdrant 响应，Kafka、已构建 Collector、ClickHouse 为真实实例。结果在 `output/acceptance/w18-page-result.json`，详细检查与限制见 `.agents/Documents/项目计划/W18-W20-页面真实链路与独立验收.md`。
 
-G2 验收分清两条边界：已经验证浏览器生成的 Trace ID 与服务端/RAG/LLM 树关联；尚未验证 Web 性能/异常事件与服务端的完整联合执行树或跨服务 parent 上下文，该项属于 Phase 3/G3。控制台接入文档提供原生 HTTP 上报示例，不要求安装尚未发布的 SDK；密钥只由可信服务端持有，项目创建与服务注册使用 [API 管理接口](apps/api/README.md)，演示设置页不能创建或复制真实密钥。
+G2 验收分清两条边界：已经验证浏览器生成的 Trace ID 与服务端/RAG/LLM 树关联；尚未验证 Web 性能/异常事件与服务端的完整联合执行树或跨服务 parent 上下文，该项属于 Phase 3/G3。控制台接入文档提供原生 HTTP 上报示例，不要求安装尚未发布的 SDK；密钥只由可信服务端持有。项目创建与服务注册可由本地控制台通过管理 API 完成，创建的项目写入凭证仅在创建响应时显示一次。
 
 ## W8 本地真实链路验收
 

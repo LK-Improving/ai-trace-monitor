@@ -45,7 +45,11 @@ export interface AlertListQuery {
   level: AlertLevelFilter;
   page: number;
   pageSize: number;
+  from: string;
+  to: string;
 }
+
+export type AlertTimeWindow = Pick<AlertListQuery, 'from' | 'to'>;
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TRACE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -134,9 +138,19 @@ function assertListQuery(query: AlertListQuery): void {
     || !(query.level === 'all' || ALERT_LEVELS.has(query.level))
     || !Number.isSafeInteger(query.page) || query.page < 1 || query.page > 1000
     || !Number.isSafeInteger(query.pageSize) || query.pageSize < 1 || query.pageSize > 100
-    || (query.page - 1) * query.pageSize > 10_000) {
+    || (query.page - 1) * query.pageSize > 10_000 || !validWindow(query)) {
     throw new TypeError('Invalid alert filters');
   }
+}
+
+function validWindow(window: AlertTimeWindow): boolean {
+  const pattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+  if (!pattern.test(window.from) || !pattern.test(window.to)) return false;
+  const from = Date.parse(window.from);
+  const to = Date.parse(window.to);
+  return Number.isFinite(from) && Number.isFinite(to)
+    && new Date(from).toISOString() === window.from && new Date(to).toISOString() === window.to
+    && from < to && to - from <= 30 * 24 * 60 * 60 * 1000;
 }
 
 function statusMessage(status: number): string {
@@ -176,13 +190,15 @@ export async function fetchAlerts(query: AlertListQuery, signal?: AbortSignal): 
     level: query.level,
     page: String(query.page),
     pageSize: String(query.pageSize),
+    from: query.from,
+    to: query.to,
   });
   return parseAlertListPayload(await requestJson(`/api/v1/alerts?${params.toString()}`, signal), query);
 }
 
-export async function fetchAlertSummary(projectId: string, environment: OverviewEnvironment, signal?: AbortSignal): Promise<AlertSummary> {
-  if (!UUID_PATTERN.test(projectId) || !ENVIRONMENTS.has(environment)) throw new TypeError('Invalid alert summary filters');
-  const params = new URLSearchParams({ projectId, environment });
+export async function fetchAlertSummary(projectId: string, environment: OverviewEnvironment, window: AlertTimeWindow, signal?: AbortSignal): Promise<AlertSummary> {
+  if (!UUID_PATTERN.test(projectId) || !ENVIRONMENTS.has(environment) || !validWindow(window)) throw new TypeError('Invalid alert summary filters');
+  const params = new URLSearchParams({ projectId, environment, from: window.from, to: window.to });
   return parseAlertSummaryPayload(await requestJson(`/api/v1/alerts/summary?${params.toString()}`, signal));
 }
 

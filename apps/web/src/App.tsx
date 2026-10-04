@@ -14,6 +14,7 @@ import { createTimeWindow, createTimeWindowAround, fetchTraceList, type TraceLis
 import { AiChainPage, TraceDetail, TraceExplorer, type TraceSelection } from './pages/LivePages';
 import { AlertsPage, DocsPage, OverviewPage, SettingsPage } from './pages/Pages';
 import { PlatformOperationsPage } from './pages/PlatformOperationsPage';
+import { ProjectCreateDialog } from './pages/ProjectCreateDialog';
 
 type PageName = 'overview' | 'traces' | 'ai' | 'alerts' | 'settings' | 'operations' | 'docs';
 type ProjectState =
@@ -61,18 +62,18 @@ function isApiPage(page: PageName): boolean {
   return page === 'overview' || page === 'traces' || page === 'ai' || page === 'alerts' || page === 'operations';
 }
 
-function ProjectGate({ state, onRetry }: { state: ProjectState; onRetry: () => void }) {
+function ProjectGate({ state, onRetry, onCreate }: { state: ProjectState; onRetry: () => void; onCreate: () => void }) {
   const message = state.status === 'loading'
     ? '正在加载项目列表…'
     : state.status === 'error'
       ? state.message
       : state.projects.length === 0
-        ? '当前没有可用项目，请先配置项目后再查看监控数据。'
+        ? '当前没有可用项目。创建项目后即可注册服务并接入第一条 Trace。'
         : '正在确认当前项目…';
   const canRetry = state.status === 'error' || (state.status === 'ready' && state.projects.length === 0);
   const isError = state.status === 'error';
   return <section className="module-page"><div className={`overview-status ${isError ? 'error' : 'info'}`} role={isError ? 'alert' : 'status'} aria-live="polite">
-    <span>{message}</span>{canRetry && <button className="text-action" type="button" onClick={onRetry}>重试<Icon name="arrow" size={14} /></button>}
+    <span>{message}</span><span className="project-gate-actions">{state.status === 'ready' && state.projects.length === 0 && <button className="button primary compact" type="button" onClick={onCreate}>创建项目</button>}{canRetry && <button className="text-action" type="button" onClick={onRetry}>重试<Icon name="arrow" size={14} /></button>}</span>
   </div></section>;
 }
 
@@ -88,6 +89,9 @@ export default function App() {
   const [selectedTrace, setSelectedTrace] = useState<TraceSelection | null>(null);
   const [toast, setToast] = useState('');
   const [settingsUsesApi, setSettingsUsesApi] = useState(false);
+  const [createProjectOpen, setCreateProjectOpen] = useState(false);
+  const [onboardingProjectId, setOnboardingProjectId] = useState<string | null>(null);
+  const projectMutationRef = useRef(0);
   const currentPageUsesApi = isApiPage(page) || (page === 'settings' && settingsUsesApi);
   const selectedProject = projectState.status === 'ready'
     ? projectState.projects.find((project) => project.id === projectId)
@@ -95,13 +99,14 @@ export default function App() {
 
   useEffect(() => {
     const controller = new AbortController();
+    const version = projectMutationRef.current;
     setProjectState({ status: 'loading' });
     fetchProjects(controller.signal).then((projects) => {
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || version !== projectMutationRef.current) return;
       setProjectState({ status: 'ready', projects });
       setProjectId((current) => projects.some((project) => project.id === current) ? current : projects[0]?.id ?? '');
     }).catch((error: unknown) => {
-      if (!controller.signal.aborted) setProjectState({ status: 'error', message: overviewErrorMessage(error) });
+      if (!controller.signal.aborted && version === projectMutationRef.current) setProjectState({ status: 'error', message: overviewErrorMessage(error) });
     });
     return () => controller.abort();
   }, [projectRetry]);
@@ -187,6 +192,19 @@ export default function App() {
     setTimeRange(nextRange);
   };
   const retryProjects = () => setProjectRetry((count) => count + 1);
+  const projectCreated = (project: ProjectOption) => {
+    projectMutationRef.current += 1;
+    setProjectState((current) => current.status === 'ready'
+      ? { status: 'ready', projects: [project, ...current.projects.filter((item) => item.id !== project.id)] }
+      : { status: 'ready', projects: [project] });
+    setProjectId(project.id);
+    setOnboardingProjectId(project.id);
+    setCreateProjectOpen(false);
+    setSelectedTrace(null);
+    setSettingsUsesApi(true);
+    setPage('settings');
+    notify(`项目「${project.name}」已创建，请先注册服务。`);
+  };
   const retryOverview = () => {
     if (projectState.status === 'error' || (projectState.status === 'ready' && projectState.projects.length === 0)) retryProjects();
     else setOverviewRetry((count) => count + 1);
@@ -219,6 +237,7 @@ export default function App() {
         <div className="nav-divider" />
         {navigation.slice(4).map((item) => <button key={item.id} type="button" className={`nav-item ${page === item.id ? 'active' : ''}`} onClick={() => navigate(item.id)} aria-label={item.label} title={item.label} aria-current={page === item.id ? 'page' : undefined}><Icon name={item.icon} /><span>{item.label}</span></button>)}
       </nav>
+      {page !== 'operations' && <button className="sidebar-create-project" type="button" onClick={() => setCreateProjectOpen(true)}>＋ 创建项目</button>}
       <div className="sidebar-foot"><span><i className="connection-dot" />{currentPageUsesApi ? '真实接口' : '演示页面'}</span><span className="version">v0.1.0</span></div>
     </aside>
 
@@ -249,22 +268,24 @@ export default function App() {
           range={timeRange}
           empty={overviewHasNoSamples}
           onRetry={retryOverview}
+          onCreateProject={() => setCreateProjectOpen(true)}
           onSelectTrace={(traceId, traceEnvironment, window) => openTrace({ traceId, environment: traceEnvironment, window })}
         /></>}
         {page === 'traces' && (!selectedProject
-          ? <ProjectGate state={projectState} onRetry={retryProjects} />
+          ? <ProjectGate state={projectState} onRetry={retryProjects} onCreate={() => setCreateProjectOpen(true)} />
           : selectedTrace
             ? <TraceDetail key={selectedTraceKey} projectId={selectedProject.id} selection={selectedTrace} onBack={() => setSelectedTrace(null)} />
             : <TraceExplorer key={tracePageKey} projectId={selectedProject.id} environment={environment} range={timeRange} onSelectTrace={openTrace} />)}
         {page === 'ai' && (!selectedProject
-          ? <ProjectGate state={projectState} onRetry={retryProjects} />
+          ? <ProjectGate state={projectState} onRetry={retryProjects} onCreate={() => setCreateProjectOpen(true)} />
           : <AiChainPage key={`ai:${tracePageKey}`} projectId={selectedProject.id} environment={environment} range={timeRange} />)}
         {page === 'alerts' && (!selectedProject
-          ? <ProjectGate state={projectState} onRetry={retryProjects} />
+          ? <ProjectGate state={projectState} onRetry={retryProjects} onCreate={() => setCreateProjectOpen(true)} />
           : <AlertsPage
-            key={JSON.stringify([selectedProject.id, environment])}
+            key={JSON.stringify([selectedProject.id, environment, timeRange])}
             projectId={selectedProject.id}
             environment={environment}
+            range={timeRange}
             onNotify={notify}
             onSelectTrace={(traceId, traceEnvironment, lastSeenAt) => openTrace({
               traceId,
@@ -273,12 +294,13 @@ export default function App() {
             })}
           />)}
         {page === 'settings' && (!selectedProject
-          ? <ProjectGate state={projectState} onRetry={retryProjects} />
-          : <SettingsPage projectId={selectedProject.id} projectName={selectedProject.name} environment={environment} onNotify={notify} onDataSourceChange={setSettingsUsesApi} />)}
+          ? <ProjectGate state={projectState} onRetry={retryProjects} onCreate={() => setCreateProjectOpen(true)} />
+          : <SettingsPage key={selectedProject.id} projectId={selectedProject.id} projectName={selectedProject.name} environment={environment} onboarding={onboardingProjectId === selectedProject.id} onFinishOnboarding={() => setOnboardingProjectId(null)} onOpenDocs={() => navigate('docs')} onNotify={notify} onDataSourceChange={setSettingsUsesApi} />)}
         {page === 'docs' && <DocsPage onNotify={notify} />}
         <footer className="page-footer"><span>TRACE OPS <i>·</i> AI 全链路监控</span><span>{page === 'operations' ? '平台级检查 · API 数据' : `${getRangeLabel(timeRange)} · ${currentPageUsesApi ? '接口数据' : '演示数据'}`}</span></footer>
       </div>
     </main>
     {toast && <div className="toast-message" role="status"><span className="toast-check"><Icon name="check" size={14} /></span>{toast}</div>}
+    {createProjectOpen && <ProjectCreateDialog onClose={() => setCreateProjectOpen(false)} onCreated={projectCreated} />}
   </div>;
 }

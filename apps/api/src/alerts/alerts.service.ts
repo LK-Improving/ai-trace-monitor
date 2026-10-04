@@ -110,11 +110,13 @@ export class AlertsService {
     await this.assertProjectExists(query.projectId);
 
     try {
-      const values = [query.projectId, query.environment, query.state, query.level];
+      const values = [query.projectId, query.environment, query.state, query.level, query.from ?? null, query.to ?? null];
       const where = `project_id = $1
         AND ($2 = 'all' OR environment = $2)
         AND ($3 = 'all' OR state = $3)
-        AND ($4 = 'all' OR level = $4)`;
+        AND ($4 = 'all' OR level = $4)
+        AND ($5::timestamptz IS NULL OR last_seen_at >= $5::timestamptz)
+        AND ($6::timestamptz IS NULL OR last_seen_at < $6::timestamptz)`;
       const [countResult, listResult] = await Promise.all([
         this.database.query<{ total: unknown }>(
           `SELECT count(*) AS total FROM alert_incidents WHERE ${where}`,
@@ -126,7 +128,7 @@ export class AlertsService {
            FROM alert_incidents
            WHERE ${where}
            ORDER BY last_seen_at DESC, id DESC
-           LIMIT $5 OFFSET $6`,
+           LIMIT $7 OFFSET $8`,
           [...values, query.pageSize, query.offset],
         ),
       ]);
@@ -163,8 +165,10 @@ export class AlertsService {
            count(*) FILTER (WHERE state = 'resolved') AS resolved,
            count(*) FILTER (WHERE state = 'active' AND level = 'critical') AS critical_active
          FROM alert_incidents
-         WHERE project_id = $1 AND ($2 = 'all' OR environment = $2)`,
-        [query.projectId, query.environment],
+         WHERE project_id = $1 AND ($2 = 'all' OR environment = $2)
+           AND ($3::timestamptz IS NULL OR last_seen_at >= $3::timestamptz)
+           AND ($4::timestamptz IS NULL OR last_seen_at < $4::timestamptz)`,
+        [query.projectId, query.environment, query.from ?? null, query.to ?? null],
       );
       if (result.rows.length !== 1) throw new Error('Invalid alert summary');
       const row = result.rows[0]!;
